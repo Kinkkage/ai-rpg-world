@@ -1,4 +1,5 @@
 # server/app/main.py
+import os
 from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
 from typing import List, Literal, Optional, Dict, Any
@@ -38,8 +39,18 @@ async def health_db(session: AsyncSession = Depends(get_session)):
         await session.execute(text("select 1"))
         return {"db": "ok"}
     except Exception as e:
-        # чтобы точно увидеть ошибку в логах Render
+        # показать точную причину
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/health/env")
+def health_env():
+    """Диагностика окружения, чтобы понять, кто подмешивает sslmode."""
+    db_url = os.getenv("DATABASE_URL", "")
+    return {
+        "PGSSLMODE": os.getenv("PGSSLMODE", None),
+        "DATABASE_URL_has_sslmode": ("sslmode=" in db_url),
+        "DATABASE_URL_has_ssl": ("ssl=" in db_url),
+    }
 
 # ---------- NODE from DB ----------
 @app.get("/node/{node_id}")
