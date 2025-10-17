@@ -6,21 +6,21 @@ from typing import List, Literal, Optional, Dict, Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 
-# DB/DAO (наши модули)
-from app.db import get_session, resolve_db_host
+# DB/DAO
+from app.db import get_session           # ← только это
 from app.dao import fetch_node, fetch_inventory
 
 app = FastAPI(title="AI RPG World")
 
 # ---------- SCHEMAS ----------
 class Intent(BaseModel):
-    type: Literal["MOVE", "INSPECT", "TALK", "EQUIP", "UNEQUIP", "USE_ITEM", "COMBINE_USE"]
+    type: Literal["MOVE","INSPECT","TALK","EQUIP","UNEQUIP","USE_ITEM","COMBINE_USE"]
     payload: Dict[str, Any]
 
 class Event(BaseModel):
     type: Literal[
-        "MOVE_ANIM", "TEXT", "HIGHLIGHT", "FX", "STATUS_APPLY", "INVENTORY",
-        "DAMAGE", "HEAL", "CONSUME", "EQUIP_CHANGE"
+        "MOVE_ANIM","TEXT","HIGHLIGHT","FX","STATUS_APPLY","INVENTORY",
+        "DAMAGE","HEAL","CONSUME","EQUIP_CHANGE"
     ]
     payload: Dict[str, Any]
 
@@ -29,34 +29,24 @@ class Event(BaseModel):
 def ping():
     return {"ok": True}
 
-@app.get("/health/env")
-def health_env():
-    """
-    Быстрый срез окружения: как выглядит DSN и какие флаги про SSL.
-    Пароль тут не показываем.
-    """
-    from urllib.parse import urlparse
-    raw = os.getenv("DATABASE_URL", "")
-    u = urlparse(raw) if raw else None
-    return {
-        "PGSSLMODE": os.getenv("PGSSLMODE"),
-        "dsn_scheme": (u.scheme if u else None),
-        "dsn_has_sslmode": (("sslmode=" in (u.query or "")) if u else None),
-        "dsn_has_ssl_flag": (("ssl=" in (u.query or "")) if u else None),
-    }
-
 @app.get("/health/db")
 async def health_db(session: AsyncSession = Depends(get_session)):
-    """
-    Проверка доступности базы + DNS-резолва хоста.
-    Вернёт {"db":"ok","dns":{...}} если всё ок.
-    """
-    dns = resolve_db_host()
+    """Простой check подключения к БД."""
     try:
         await session.execute(text("select 1"))
-        return {"db": "ok", "dns": dns}
+        return {"db": "ok"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/health/env")
+def health_env():
+    """Быстрая диагностика env-переменных по БД."""
+    db_url = os.getenv("DATABASE_URL", "")
+    return {
+        "PGSSLMODE": os.getenv("PGSSLMODE"),
+        "DATABASE_URL_has_sslmode": ("sslmode=" in db_url),
+        "DATABASE_URL_has_ssl": ("ssl=" in db_url),
+    }
 
 # ---------- NODE from DB ----------
 @app.get("/node/{node_id}")
@@ -150,7 +140,7 @@ def _consume(item_id: str, amount: int = 1) -> List[Event]:
 def _use_item_single(item_id: str, target: Optional[str] = None) -> List[Event]:
     item = ITEMS[item_id]
     p = item["props"]
-    ev = []
+    ev: List[Event] = []
     if p.get("water"):
         ev += _consume(item_id, p.get("consumes_per_use", 1))
         ev.append({"type": "FX", "payload": {"kind": "splash", "on": target or "ground"}})
@@ -164,7 +154,7 @@ def _use_item_single(item_id: str, target: Optional[str] = None) -> List[Event]:
     return ev
 
 def _combine_use(left_id: str, right_id: str, target: Optional[str] = None) -> List[Event]:
-    ev = []
+    ev: List[Event] = []
     pair = set([left_id, right_id])
     if {"lighter", "deodorant"} == pair:
         ev += _consume("lighter", 1)
@@ -228,3 +218,4 @@ def talk(input: TalkIn):
     if input.npc_id == "king":
         return {"say": "Я слушаю. Что тебе нужно?", "intents": []}
     return {"say": "...", "intents": []}
+
