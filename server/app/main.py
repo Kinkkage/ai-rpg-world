@@ -6,21 +6,21 @@ from typing import List, Literal, Optional, Dict, Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 
-# DB/DAO
-from app.db import get_session
+# DB/DAO (наши модули)
+from app.db import get_session, resolve_db_host
 from app.dao import fetch_node, fetch_inventory
 
 app = FastAPI(title="AI RPG World")
 
 # ---------- SCHEMAS ----------
 class Intent(BaseModel):
-    type: Literal["MOVE","INSPECT","TALK","EQUIP","UNEQUIP","USE_ITEM","COMBINE_USE"]
+    type: Literal["MOVE", "INSPECT", "TALK", "EQUIP", "UNEQUIP", "USE_ITEM", "COMBINE_USE"]
     payload: Dict[str, Any]
 
 class Event(BaseModel):
     type: Literal[
-        "MOVE_ANIM","TEXT","HIGHLIGHT","FX","STATUS_APPLY","INVENTORY",
-        "DAMAGE","HEAL","CONSUME","EQUIP_CHANGE"
+        "MOVE_ANIM", "TEXT", "HIGHLIGHT", "FX", "STATUS_APPLY", "INVENTORY",
+        "DAMAGE", "HEAL", "CONSUME", "EQUIP_CHANGE"
     ]
     payload: Dict[str, Any]
 
@@ -29,28 +29,34 @@ class Event(BaseModel):
 def ping():
     return {"ok": True}
 
+@app.get("/health/env")
+def health_env():
+    """
+    Быстрый срез окружения: как выглядит DSN и какие флаги про SSL.
+    Пароль тут не показываем.
+    """
+    from urllib.parse import urlparse
+    raw = os.getenv("DATABASE_URL", "")
+    u = urlparse(raw) if raw else None
+    return {
+        "PGSSLMODE": os.getenv("PGSSLMODE"),
+        "dsn_scheme": (u.scheme if u else None),
+        "dsn_has_sslmode": (("sslmode=" in (u.query or "")) if u else None),
+        "dsn_has_ssl_flag": (("ssl=" in (u.query or "")) if u else None),
+    }
+
 @app.get("/health/db")
 async def health_db(session: AsyncSession = Depends(get_session)):
     """
-    Проверка подключения к базе данных.
-    Вернёт {"db": "ok"}, если всё работает.
+    Проверка доступности базы + DNS-резолва хоста.
+    Вернёт {"db":"ok","dns":{...}} если всё ок.
     """
+    dns = resolve_db_host()
     try:
         await session.execute(text("select 1"))
-        return {"db": "ok"}
+        return {"db": "ok", "dns": dns}
     except Exception as e:
-        # показать точную причину
         raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/health/env")
-def health_env():
-    """Диагностика окружения, чтобы понять, кто подмешивает sslmode."""
-    db_url = os.getenv("DATABASE_URL", "")
-    return {
-        "PGSSLMODE": os.getenv("PGSSLMODE", None),
-        "DATABASE_URL_has_sslmode": ("sslmode=" in db_url),
-        "DATABASE_URL_has_ssl": ("ssl=" in db_url),
-    }
 
 # ---------- NODE from DB ----------
 @app.get("/node/{node_id}")
