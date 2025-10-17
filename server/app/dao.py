@@ -49,16 +49,17 @@ async def fetch_inventory(session: AsyncSession, actor_id: str):
         """), {"iid": item_id})).mappings().first()
         return row
 
-    left = await item_view(inv["left_item"])
+    left  = await item_view(inv["left_item"])
     right = await item_view(inv["right_item"])
 
     backpack = []
     if inv["backpack"]:
+        # ВАЖНО: вместо ANY(:ids) используем UNNEST для совместимости с asyncpg
         rows = (await session.execute(text("""
             select i.id, k.title, i.charges
-            from items i
+            from unnest(:ids::uuid[]) as bid
+            join items i on i.id = bid
             join item_kinds k on k.id = i.kind_id
-            where i.id = any(:ids)
         """), {"ids": inv["backpack"]})).mappings().all()
         backpack = list(rows)
 
