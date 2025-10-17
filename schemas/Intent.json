@@ -1,0 +1,9 @@
+{
+  "type": "object",
+  "required": ["type", "payload"],
+  "properties": {
+    "type": { "type": "string", "enum": ["MOVE","INSPECT","TALK","EQUIP","UNEQUIP","USE_ITEM","COMBINE_USE"] },
+    "payload": { "type": "object" }
+  }
+}
+

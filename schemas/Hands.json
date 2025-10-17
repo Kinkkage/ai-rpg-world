@@ -1,0 +1,8 @@
+{
+  "type": "object",
+  "properties": {
+    "left_hand": { "type": "string", "nullable": true },
+    "right_hand": { "type": "string", "nullable": true },
+    "backpack": { "type": "array", "items": { "type": "string" } }
+  }
+}

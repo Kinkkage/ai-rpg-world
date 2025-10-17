@@ -1,0 +1,17 @@
+{
+  "type": "object",
+  "properties": {
+    "id": { "type": "string" },
+    "title": { "type": "string" },
+    "size": {
+      "type": "object",
+      "properties": {
+        "w": { "type": "integer" },
+        "h": { "type": "integer" }
+      }
+    },
+    "props": { "type": "array" },
+    "actors": { "type": "array" },
+    "exits": { "type": "array" }
+  }
+}

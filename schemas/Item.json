@@ -1,0 +1,29 @@
+{
+  "type": "object",
+  "required": ["id", "title", "tags", "props"],
+  "properties": {
+    "id": { "type": "string" },
+    "title": { "type": "string" },
+    "description": { "type": "string" },
+    "tags": { "type": "array", "items": { "type": "string" } },
+    "handedness": { "type": "string", "enum": ["one_hand", "two_hands"], "default": "one_hand" },
+    "stackable": { "type": "boolean", "default": false },
+    "charges": { "type": "integer", "minimum": 0, "default": 0 },
+    "durability": { "type": "integer", "minimum": 0, "default": 0 },
+    "props": {
+      "type": "object",
+      "description": "Свойства/способности предмета",
+      "properties": {
+        "ignite": { "type": "boolean", "default": false },
+        "spray": { "type": "boolean", "default": false },
+        "projectile": { "type": "boolean", "default": false },
+        "heal": { "type": "integer", "default": 0 },
+        "water": { "type": "boolean", "default": false },
+        "flammable": { "type": "boolean", "default": false },
+        "ammo_type": { "type": "string", "default": "" },
+        "consumes_per_use": { "type": "integer", "default": 1 }
+      },
+      "additionalProperties": true
+    }
+  }
+}

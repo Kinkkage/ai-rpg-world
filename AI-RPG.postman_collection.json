@@ -1,0 +1,53 @@
+{
+  "info": { 
+    "name": "AI-RPG API", 
+    "_postman_id": "example-id",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Ping",
+      "request": { "method": "GET", "url": "{{base_url}}/ping" }
+    },
+    {
+      "name": "Node: castle_hall",
+      "request": { "method": "GET", "url": "{{base_url}}/node/castle_hall" }
+    },
+    {
+      "name": "Intent: EQUIP lighter → right",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"type\": \"EQUIP\",\n  \"payload\": { \"hand\": \"right\", \"item_id\": \"lighter\" }\n}"
+        },
+        "url": "{{base_url}}/intent"
+      }
+    },
+    {
+      "name": "Intent: USE_ITEM lighter",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"type\": \"USE_ITEM\",\n  \"payload\": { \"item_id\": \"lighter\" }\n}"
+        },
+        "url": "{{base_url}}/intent"
+      }
+    },
+    {
+      "name": "Talk: king",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"npc_id\": \"king\",\n  \"text\": \"привет\"\n}"
+        },
+        "url": "{{base_url}}/talk"
+      }
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "type": "object",
+  "required": ["type", "payload"],
+  "properties": {
+    "type": { "type": "string", "enum": ["MOVE_ANIM", "TEXT", "HIGHLIGHT"] },
+    "payload": { "type": "object" }
+  }
+}
