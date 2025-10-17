@@ -6,20 +6,30 @@ from sqlalchemy.engine.url import make_url
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
-# Автофикс: если кто-то снова поставит sslmode=require при +asyncpg
-if DATABASE_URL and "+asyncpg" in DATABASE_URL and "sslmode=" in DATABASE_URL:
-    # аккуратно перепакуем query часть
-    url = make_url(DATABASE_URL)
-    q = dict(url.query)
-    q.pop("sslmode", None)
-    q["ssl"] = "true"
-    url = url.set(query=q)
-    DATABASE_URL = str(url)
+# Авто-нормализация для asyncpg:
+# если кто-то случайно оставил ?sslmode=require — заменим на ?ssl=true
+if DATABASE_URL:
+    try:
+        url = make_url(DATABASE_URL)
+        if "+asyncpg" in url.drivername:
+            q = dict(url.query)
+            if "sslmode" in q:      # psycopg-параметр → ломает asyncpg
+                q.pop("sslmode", None)
+            # если ssl не задан — включим
+            q.setdefault("ssl", "true")
+            url = url.set(query=q)
+            DATABASE_URL = str(url)
+    except Exception:
+        # В крайнем случае грубой заменой
+        DATABASE_URL = DATABASE_URL.replace("sslmode=require", "ssl=true")
 
-# (необязательно) отладочный print — увидишь в Render Logs текущий URL
-print("📡 DB URL =", DATABASE_URL)
+print("📡 DB URL used by app =", DATABASE_URL)
 
-engine = create_async_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=False,
+    pool_pre_ping=True,
+)
 async_session = sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 async def get_session() -> AsyncSession:
