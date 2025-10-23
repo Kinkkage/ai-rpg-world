@@ -1519,3 +1519,329 @@ async def drop_hidden_to_ground_db(session: AsyncSession, actor_id: str):
 
     await session.commit()
     return {"ok": True, "object_id": obj_id, "dropped": str(item_id), "node_id": node_id, "x": drop_x, "y": drop_y}
+# ===================== AMMO / CONSUMABLES (DAO) =====================
+
+# ВНИМАНИЕ: предполагается, что миграции уже добавили поля:
+#   item_kinds.ammo_type, item_kinds.max_charges, item_kinds.range_cells, item_kinds.use_effect
+#   items.charges (у тебя есть)
+# И есть справочник ammo_types(id, ...). Если FK не хочешь — можно без неё.
+
+async def _get_item_with_kind(session: AsyncSession, item_id: str):
+    """Тянем предмет + поля его kind, нужные для логики зарядов/расходников."""
+    row = (
+        await session.execute(
+            text("""
+                SELECT i.id, i.kind_id, i.charges, i.durability,
+                       k.title, k.tags, k.handedness, k.props,
+                       k.ammo_type, k.max_charges, k.range_cells, k.use_effect
+                  FROM items i
+                  JOIN item_kinds k ON k.id = i.kind_id
+                 WHERE i.id = :iid
+            """),
+            {"iid": item_id},
+        )
+    ).mappings().first()
+    return dict(row) if row else None
+
+
+async def _delete_item_everywhere(session: AsyncSession, item_id: str):
+    """
+    Полное удаление предмета с очисткой всех ссылок.
+    Используется при выработке расходника или расходе патронов-предметов.
+    """
+    # очистка из инвентарей актёров
+    await session.execute(text("""
+        UPDATE inventories
+           SET left_item    = CASE WHEN left_item    = CAST(:iid AS uuid) THEN NULL ELSE left_item END,
+               right_item   = CASE WHEN right_item   = CAST(:iid AS uuid) THEN NULL ELSE right_item END,
+               hidden_slot  = CASE WHEN hidden_slot  = CAST(:iid AS uuid) THEN NULL ELSE hidden_slot END,
+               equipped_bag = CASE WHEN equipped_bag = CAST(:iid AS uuid) THEN NULL ELSE equipped_bag END,
+               backpack     = array_remove(coalesce(backpack,'{}'::uuid[]), CAST(:iid AS uuid))
+    """), {"iid": item_id})
+
+    # очистка из переносимых контейнеров
+    await session.execute(text("""
+        DELETE FROM carried_container_slots WHERE item_id = CAST(:iid AS uuid)
+    """), {"iid": item_id})
+
+    # очистка из контейнеров на земле
+    await session.execute(text("""
+        UPDATE object_inventories
+           SET items = array_remove(items, CAST(:iid AS uuid))
+    """), {"iid": item_id})
+
+    # сам предмет
+    await session.execute(text("DELETE FROM items WHERE id = :iid"), {"iid": item_id})
+
+
+async def consume_charge_db(session: AsyncSession, item_id: str, amount: int = 1):
+    """
+    Списывает charges у предмета. Возвращает {"ok", "left"}.
+    Если charges == NULL -> предмет не имеет счётчика (ничего не делаем).
+    Если не хватает — вернёт {"ok": False, "error": "empty"}.
+    """
+    row = await _get_item_with_kind(session, item_id)
+    if not row:
+        return {"ok": False, "error": "item_not_found"}
+
+    charges = row.get("charges")
+    if charges is None:
+        # нет счётчика — например, меч
+        return {"ok": True, "left": None}
+
+    if int(charges or 0) < amount:
+        return {"ok": False, "error": "empty", "left": int(charges or 0)}
+
+    new_row = (
+        await session.execute(
+            text("""UPDATE items SET charges = charges - :a WHERE id=:iid RETURNING charges"""),
+            {"a": amount, "iid": item_id},
+        )
+    ).mappings().first()
+    left = int(new_row["charges"] if new_row and new_row["charges"] is not None else 0)
+    return {"ok": True, "left": left}
+
+
+async def reload_weapon_db(session: AsyncSession, actor_id: str, weapon_item_id: str):
+    """
+    Перезаряжает оружие из рюкзака патронами нужного типа.
+    - Оружие: item_kinds.ammo_type = 'small'|'gas'|..., max_charges > 0
+    - В магазин оружия записывается items.charges
+    - Патроны — это отдельные items, у которых kind.ammo_type совпадает, их items.charges расходуем.
+      При нуле — предмет патронов удаляется.
+    Возвращает dict с событием RELOAD (для WS), либо ошибку.
+    """
+    w = await _get_item_with_kind(session, weapon_item_id)
+    if not w:
+        return {"ok": False, "error": "weapon_not_found"}
+
+    cap = int(w.get("max_charges") or 0)
+    if cap <= 0:
+        return {"ok": False, "error": "not_reloadable"}
+
+    ammo_type = w.get("ammo_type")
+    if not ammo_type:
+        # Оружие без внешних патронов (внутренние заряды) — перезарядка не через боеприпасы
+        return {"ok": False, "error": "no_external_ammo"}
+
+    cur = int(w.get("charges") or 0)
+    if cur >= cap:
+        return {"ok": False, "error": "already_full", "left": cur}
+
+    # Забираем список id из рюкзака
+    inv = (
+        await session.execute(
+            text("""SELECT backpack FROM inventories WHERE actor_id=:aid"""),
+            {"aid": actor_id},
+        )
+    ).mappings().first()
+    backpack_ids = [str(x) for x in (inv and inv["backpack"] or [])]
+    if not backpack_ids:
+        return {"ok": False, "error": "no_ammo_in_backpack"}
+
+    # Подтянем предметы из рюкзака
+    stmt = text("""
+        SELECT i.id, i.charges, k.ammo_type, k.title
+          FROM items i JOIN item_kinds k ON k.id = i.kind_id
+         WHERE i.id = ANY(:ids)
+    """).bindparams(bindparam("ids", value=backpack_ids, type_=ARRAY(UUID(as_uuid=True))))
+    rows = (await session.execute(stmt)).mappings().all()
+
+    need = cap - cur
+    loaded = 0
+    used_list = []
+
+    for r in rows:
+        if r["ammo_type"] != ammo_type:
+            continue
+        ammo_left = int(r.get("charges") or 0)
+        if ammo_left <= 0 or need <= 0:
+            continue
+
+        take = min(ammo_left, need)
+
+        # Списываем у пачки патронов
+        new_left = (
+            await session.execute(
+                text("""UPDATE items SET charges = charges - :t WHERE id=:iid RETURNING charges"""),
+                {"t": take, "iid": r["id"]},
+            )
+        ).mappings().first()["charges"]
+
+        # Если пачка опустела — удаляем предмет полностью
+        if int(new_left or 0) <= 0:
+            await _delete_item_everywhere(session, str(r["id"]))
+
+        used_list.append({"ammo_item_id": str(r["id"]), "taken": int(take)})
+        loaded += take
+        need -= take
+        if need <= 0:
+            break
+
+    if loaded == 0:
+        return {"ok": False, "error": "no_usable_ammo"}
+
+    # Кладём в магазин оружия
+    new_weapon_charges = (
+        await session.execute(
+            text("""UPDATE items SET charges = COALESCE(charges,0) + :add WHERE id=:iid RETURNING charges"""),
+            {"add": loaded, "iid": weapon_item_id},
+        )
+    ).mappings().first()["charges"]
+
+    await session.commit()
+    return {
+        "ok": True,
+        "loaded": int(loaded),
+        "weapon_charges": int(new_weapon_charges or 0),
+        "used": used_list,
+        "event": {
+            "type": "RELOAD",
+            "payload": {"item_id": str(weapon_item_id), "delta": int(loaded), "left": int(new_weapon_charges or 0)}
+        },
+    }
+
+
+async def use_consumable_db(session: AsyncSession, actor_id: str, item_id: str):
+    """
+    Использование расходника/аптечки/еды.
+    Логика:
+      - читаем item_kinds.use_effect;
+      - применяем простой эффект (например, HEAL_50);
+      - если max_charges > 0 — списываем 1 charge, при 0 удаляем;
+        иначе (одноразовый) — удаляем сразу.
+    Возвращает {"ok":True, "events":[...]}.
+    """
+        # просто делегируем универсальной функции
+    return await use_item_db(session, actor_id, item_id)
+
+# универсальная функция использования предмета
+async def use_item_db(session: AsyncSession, actor_id: str, item_id: str, target_id: str | None = None):
+    """
+    Универсальное использование предмета.
+    Если предмет имеет use_effect — применяет его.
+    Если charges > 0 — тратит 1 заряд.
+    Если charges <= 0 — удаляет предмет.
+    """
+    from sqlalchemy import text
+
+    # достаём предмет и его kind
+    q = await session.execute(text("""
+        SELECT i.id, i.charges, k.title, k.use_effect
+        FROM items i
+        JOIN item_kinds k ON i.kind_id = k.id
+        WHERE i.id = :iid
+    """), {"iid": item_id})
+    item = q.mappings().first()
+    if not item:
+        return [{"type": "TEXT", "payload": {"text": "Предмет не найден."}}]
+
+    events = []
+    use_effect = item["use_effect"] or ""
+
+    # --- обработка эффектов ---
+    if use_effect.startswith("HEAL_"):
+        heal_amount = int(use_effect.split("_")[1])
+        await session.execute(text("""
+            UPDATE actors SET hp = LEAST(hp + :heal, 100) WHERE id = :aid
+        """), {"aid": actor_id, "heal": heal_amount})
+        events.append({"type": "ITEM_USE", "payload": {"effect": "heal", "amount": heal_amount}})
+
+    elif use_effect.startswith("BURN_"):
+        dmg = int(use_effect.split("_")[1])
+        target = target_id or actor_id
+        await session.execute(text("""
+            UPDATE actors SET hp = GREATEST(hp - :dmg, 0) WHERE id = :tid
+        """), {"tid": target, "dmg": dmg})
+        events.append({"type": "ITEM_USE", "payload": {"effect": "burn", "amount": dmg}})
+
+    elif use_effect:
+        events.append({"type": "ITEM_USE", "payload": {"effect": use_effect}})
+    else:
+        events.append({"type": "TEXT", "payload": {"text": "Ничего не произошло."}})
+
+    # --- расход зарядов ---
+    if item["charges"] is not None:
+        if item["charges"] > 1:
+            await session.execute(text("UPDATE items SET charges = charges - 1 WHERE id = :iid"), {"iid": item_id})
+            events.append({"type": "CONSUME", "payload": {"item": item["title"], "delta": -1, "left": item["charges"] - 1}})
+        else:
+            await session.execute(text("DELETE FROM items WHERE id = :iid"), {"iid": item_id})
+            events.append({"type": "ITEM_DESTROYED", "payload": {"item": item["title"]}})
+
+    await session.commit()
+    return events
+
+
+    it = await _get_item_with_kind(session, item_id)
+    if not it:
+        return {"ok": False, "error": "item_not_found"}
+
+    effect = it.get("use_effect")
+    if not effect:
+        return {"ok": False, "error": "not_consumable"}
+
+    events: List[Dict[str, Any]] = []
+
+    # Примитивные эффекты на старте главы: HEAL_XX
+    if effect.startswith("HEAL_"):
+        try:
+            heal = int(effect.split("_")[1])
+        except Exception:
+            heal = 0
+        if heal > 0:
+            row = (
+                await session.execute(
+                    text("""UPDATE actors SET hp = LEAST(100, COALESCE(hp,0) + :h) WHERE id=:aid RETURNING hp"""),
+                    {"h": heal, "aid": actor_id},
+                )
+            ).mappings().first()
+            events.append({"type": "ITEM_USE", "payload": {"actor_id": actor_id, "item_id": str(item_id), "effect": effect, "hp": int(row["hp"])}})
+
+    # Списание/удаление
+    max_ch = int(it.get("max_charges") or 0)
+    if max_ch > 0:
+        # многоразовый расходник
+        res = await consume_charge_db(session, item_id, 1)
+        if not res["ok"]:
+            return {"ok": False, "error": "empty"}
+        left = int(res.get("left") or 0)
+        events.append({"type": "CONSUME", "payload": {"item_id": str(item_id), "delta": -1, "left": left}})
+        if left <= 0:
+            await _delete_item_everywhere(session, item_id)
+    else:
+        # одноразовый
+        await _delete_item_everywhere(session, item_id)
+
+    await session.commit()
+    return {"ok": True, "events": events}
+
+
+async def spend_shot_if_needed(session: AsyncSession, weapon_item_id: str):
+    """
+    Хелпер для /intent ATTACK:
+      - ближнее оружие (нет ammo_type и нет max_charges) -> не тратим, ok=True
+      - оружие с внутренними/внешними зарядами: списываем 1 из items.charges
+      - при нуле -> ok=False, error='empty', событие AMMO_EMPTY
+    Возвращает dict с полями ok, event (если было списание/пусто).
+    """
+    w = await _get_item_with_kind(session, weapon_item_id)
+    if not w:
+        return {"ok": False, "error": "weapon_not_found"}
+
+    if not w.get("max_charges") and not w.get("ammo_type"):
+        # ближний бой — ничего не списываем
+        return {"ok": True, "melee": True}
+
+    cur = int(w.get("charges") or 0)
+    if cur <= 0:
+        return {"ok": False, "error": "empty",
+                "event": {"type": "AMMO_EMPTY", "payload": {"item_id": str(weapon_item_id)}}}
+
+    res = await consume_charge_db(session, weapon_item_id, 1)
+    if not res["ok"]:
+        return {"ok": False, "error": "empty",
+                "event": {"type": "AMMO_EMPTY", "payload": {"item_id": str(weapon_item_id)}}}
+
+    left = int(res.get("left") or 0)
+    return {"ok": True, "event": {"type": "CONSUME", "payload": {"item_id": str(weapon_item_id), "delta": -1, "left": left}}}
