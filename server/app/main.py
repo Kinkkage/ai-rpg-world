@@ -129,6 +129,7 @@ from app.routers import battle as battle_router  # у тебя он есть п�
 from app.routers.narrative import NarrateIn, narrate as narrate_endpoint
 from app.routers.inventory import router as inventory_router
 from app.routers.items import router as items_router
+from app.routers.combat import router as combat_router
 # модуль intents — опционально
 try:
     from app.routers import intents as intents_router  # noqa: F401
@@ -1462,6 +1463,7 @@ app.include_router(battle_router.router)   # боевой роутер
 
 app.include_router(inventory_router)
 app.include_router(items_router)
+app.include_router(combat_router)
 # Health-check корень
 @app.get("/")
 async def root():

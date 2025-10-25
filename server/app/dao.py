@@ -1845,3 +1845,619 @@ async def spend_shot_if_needed(session: AsyncSession, weapon_item_id: str):
 
     left = int(res.get("left") or 0)
     return {"ok": True, "event": {"type": "CONSUME", "payload": {"item_id": str(weapon_item_id), "delta": -1, "left": left}}}
+
+# ===================== COMBAT GEOMETRY (LoS, distance, accuracy) =====================
+from typing import Iterable
+
+def _chebyshev_distance(ax: int, ay: int, bx: int, by: int) -> int:
+    return max(abs(bx - ax), abs(by - ay))
+
+def _aligned(ax: int, ay: int, bx: int, by: int) -> bool:
+    dx, dy = abs(bx - ax), abs(by - ay)
+    return dx == 0 or dy == 0 or dx == dy  # по прямой или диагонали
+
+def _bresenham_line(ax: int, ay: int, bx: int, by: int) -> Iterable[tuple[int, int]]:
+    """Клетки по линии между A и B, включая конечную, исключая стартовую."""
+    x0, y0, x1, y1 = ax, ay, bx, by
+    dx = abs(x1 - x0)
+    dy = -abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx + dy
+    x, y = x0, y0
+    first = True
+    while True:
+        if not first:
+            yield (x, y)
+        first = False
+        if x == x1 and y == y1:
+            break
+        e2 = 2 * err
+        if e2 >= dy:
+            err += dy
+            x += sx
+        if e2 <= dx:
+            err += dx
+            y += sy
+
+async def _cell_blocks_los(session: AsyncSession, node_id: str, x: int, y: int) -> bool:
+    """
+    Блокирует обзор объект, у которого в node_objects.props стоит:
+      {"block_los": true}
+    """
+    row = (
+        await session.execute(
+            text(
+                """
+                SELECT 1
+                FROM node_objects o
+                WHERE o.node_id = :nid AND o.x = :x AND o.y = :y
+                  AND (o.props ? 'block_los')
+                  AND (o.props->>'block_los')::boolean = true
+                LIMIT 1
+                """
+            ),
+            {"nid": node_id, "x": x, "y": y},
+        )
+    ).first()
+    return row is not None
+
+
+async def check_los(session: AsyncSession, node_id: str, ax: int, ay: int, bx: int, by: int) -> bool:
+    """True, если между A и B нет клеток, блокирующих обзор."""
+    for cx, cy in _bresenham_line(ax, ay, bx, by):
+        # конечную клетку (цель) тоже считаем видимой; блокируем только промежуточные
+        if (cx, cy) == (bx, by):
+            return True
+        if await _cell_blocks_los(session, node_id, cx, cy):
+            return False
+    return True
+
+async def _get_actor_pos(session: AsyncSession, actor_id: str):
+    row = (
+        await session.execute(
+            text("SELECT node_id, COALESCE(x,0) AS x, COALESCE(y,0) AS y FROM actors WHERE id=:id"),
+            {"id": actor_id},
+        )
+    ).mappings().first()
+    if not row or not row["node_id"]:
+        return None
+    return row["node_id"], int(row["x"]), int(row["y"])
+
+async def _weapon_in_hand(session: AsyncSession, actor_id: str):
+    """
+    Берём предмет из правой руки (если пусто — из левой). Возвращаем (item_id, kind_row).
+    kind_row включает нужные поля для дальности и точности.
+    """
+    inv = (
+        await session.execute(
+            text("""
+                SELECT left_item, right_item FROM inventories WHERE actor_id=:aid
+            """),
+            {"aid": actor_id},
+        )
+    ).mappings().first()
+    if not inv:
+        return None, None
+
+    hand_item = inv["right_item"] or inv["left_item"]
+    if not hand_item:
+        return None, None
+
+    kind = (
+        await session.execute(
+            text("""
+                SELECT k.id, k.title, k.weapon_class, k.damage_type,
+                       COALESCE(k.opt_range,1) AS opt_range,
+                       COALESCE(k.max_range,1) AS max_range,
+                       COALESCE(k.crit_chance,5.0) AS crit_chance,
+                       COALESCE(k.hit_bonus,0) AS hit_bonus
+                FROM items i
+                JOIN item_kinds k ON k.id = i.kind_id
+                WHERE i.id = :iid
+            """),
+            {"iid": hand_item},
+        )
+    ).mappings().first()
+    return hand_item, (dict(kind) if kind else None)
+
+def _estimate_accuracy(dist: int, aligned: bool, opt_range: int, hit_bonus: int) -> int:
+    """
+    Простая модель точности:
+      базово 100
+      если не по прямой/диагонали → -30
+      штраф -5 за каждую клетку сверх opt_range
+      + hit_bonus
+      итог ограничиваем 5..95 (чтобы не было 0 и 100)
+    """
+    acc = 100
+    if not aligned:
+        acc -= 30
+    if dist > opt_range:
+        acc -= (dist - opt_range) * 5
+    acc += hit_bonus
+    return max(5, min(95, acc))
+
+async def preview_attack_geometry_db(session: AsyncSession, attacker_id: str, target_id: str):
+    """
+    Возвращает геометрию и предварительную точность выстрела:
+      - distance, aligned, los
+      - weapon (title, opt/max, hit_bonus)
+      - projected accuracy
+    Ошибки возвращает через {"ok": False, "error": "..."}.
+    """
+    apos = await _get_actor_pos(session, attacker_id)
+    tpos = await _get_actor_pos(session, target_id)
+    if not apos:
+        return {"ok": False, "error": "attacker_not_found_or_no_position"}
+    if not tpos:
+        return {"ok": False, "error": "target_not_found_or_no_position"}
+
+    node_a, ax, ay = apos
+    node_t, tx, ty = tpos
+    if node_a != node_t:
+        return {"ok": False, "error": "different_nodes"}
+
+    dist = _chebyshev_distance(ax, ay, tx, ty)
+    aligned = _aligned(ax, ay, tx, ty)
+    los = await check_los(session, node_a, ax, ay, tx, ty)
+
+    item_id, kind = await _weapon_in_hand(session, attacker_id)
+    if not kind:
+        return {
+            "ok": True,
+            "distance": dist,
+            "aligned": aligned,
+            "los": los,
+            "weapon": None,
+            "projected_accuracy": None,
+        }
+
+    acc = _estimate_accuracy(dist, aligned, int(kind["opt_range"]), int(kind["hit_bonus"]))
+
+    return {
+        "ok": True,
+        "distance": dist,
+        "aligned": aligned,
+        "los": los,
+        "weapon": {
+            "item_id": str(item_id),
+            "title": kind["title"],
+            "weapon_class": kind["weapon_class"],
+            "damage_type": kind["damage_type"],
+            "opt_range": int(kind["opt_range"]),
+            "max_range": int(kind["max_range"]),
+            "crit_chance": float(kind["crit_chance"]),
+            "hit_bonus": int(kind["hit_bonus"]),
+        },
+        "projected_accuracy": acc,
+    }
+# ===================== COMBAT ATTACK (range/los/hit/crit/damage) =====================
+import random
+
+async def _get_resist_mod(session: AsyncSession, actor_id: str, damage_type: str) -> float:
+    row = (
+        await session.execute(
+            text("SELECT resistances FROM actors WHERE id=:id"),
+            {"id": actor_id},
+        )
+    ).mappings().first()
+    if not row:
+        return 1.0
+    res = row.get("resistances") or {}
+    try:
+        # jsonb может приехать как dict/str — нормализуем
+        if isinstance(res, str):
+            import json as _json
+            res = _json.loads(res)
+    except Exception:
+        res = {}
+    return float(res.get(damage_type, 1.0))
+
+async def _base_damage_for(kind: dict) -> int:
+    """
+    Откуда взять базовый урон:
+    1) если в props есть damage -> берём его,
+    2) иначе условно по классу: melee=5, ranged=6, magic=7 (чтобы сразу работало).
+    Ты потом сможешь задать точные цифры в item_kinds.props -> {"damage": N}.
+    """
+    props = kind.get("props") or {}
+    dmg = None
+    if isinstance(props, dict):
+        dmg = props.get("damage")
+    if isinstance(dmg, (int, float)) and dmg > 0:
+        return int(dmg)
+    wc = (kind.get("weapon_class") or "melee").lower()
+    if wc == "ranged":
+        return 6
+    if wc == "magic":
+        return 7
+    return 5  # melee по умолчанию
+
+async def _weapon_kind_for_item(session: AsyncSession, item_id: str) -> dict | None:
+    row = (
+        await session.execute(
+            text("""
+                SELECT k.id, k.title, k.weapon_class, k.damage_type, k.props,
+                       COALESCE(k.opt_range,1) AS opt_range,
+                       COALESCE(k.max_range,1) AS max_range,
+                       COALESCE(k.crit_chance,5.0) AS crit_chance,
+                       COALESCE(k.hit_bonus,0) AS hit_bonus
+                FROM items i
+                JOIN item_kinds k ON k.id = i.kind_id
+                WHERE i.id = :iid
+            """),
+            {"iid": item_id},
+        )
+    ).mappings().first()
+    return dict(row) if row else None
+
+async def _get_item_charges(session, item_id: str) -> int | None:
+    row = (await session.execute(
+        text("SELECT charges FROM items WHERE id=:iid"),
+        {"iid": item_id}
+    )).mappings().first()
+    if not row:
+        return None
+    return row["charges"]
+
+
+async def _spend_one_charge(session, item_id: str) -> int | None:
+    row = (await session.execute(
+        text("""
+            UPDATE items
+               SET charges = CASE
+                               WHEN charges IS NULL THEN NULL
+                               WHEN charges > 0 THEN charges - 1
+                               ELSE charges
+                             END
+             WHERE id=:iid
+         RETURNING charges
+        """),
+        {"iid": item_id}
+    )).mappings().first()
+    return row and row["charges"]
+
+    
+
+# ---------- Боевая логика: реальная атака ----------
+from sqlalchemy import text
+import random
+
+# ----------------- ammo helpers -----------------
+async def _weapon_ammo_type_for_item(session, item_id: str) -> str | None:
+    row = (await session.execute(
+        text("""
+            SELECT k.ammo_type
+            FROM items i
+            JOIN item_kinds k ON k.id = i.kind_id
+            WHERE i.id = :iid
+        """),
+        {"iid": item_id}
+    )).mappings().first()
+    return row and row["ammo_type"]
+
+
+async def _find_ammo_in_backpack(session, actor_id: str, ammo_type: str):
+    """
+    Ищем первый подходящий патрон в рюкзаке:
+    - inventories.backpack (uuid[])
+    - items.id = any(backpack) and item_kinds.ammo_type = :ammo_type
+    Возвращаем dict(id, title, charges) или None.
+    """
+    row = (await session.execute(
+        text("""
+            SELECT i.id, k.title, i.charges
+            FROM inventories inv
+            JOIN items i ON i.id = ANY(COALESCE(inv.backpack,'{}'::uuid[]))
+            JOIN item_kinds k ON k.id = i.kind_id
+            WHERE inv.actor_id = :aid
+              AND COALESCE(k.ammo_type, '') = :ammo
+            LIMIT 1
+        """),
+        {"aid": actor_id, "ammo": ammo_type}
+    )).mappings().first()
+    return dict(row) if row else None
+
+
+async def _consume_one_ammo_from_backpack(session, actor_id: str, ammo_item_id: str):
+    """
+    Тратим 1 заряд из ammo-предмета:
+    - если charges > 1: charges -= 1
+    - если charges <= 1 или NULL: удалить предмет и убрать из inventories.backpack
+    Возвращаем {"left": int|None, "deleted": bool}
+    """
+    # current charges
+    r = (await session.execute(
+        text("SELECT charges FROM items WHERE id=:iid"),
+        {"iid": ammo_item_id}
+    )).mappings().first()
+    if not r:
+        return {"left": None, "deleted": True}
+
+    ch = r["charges"]
+    if ch is None or ch <= 1:
+        # удаляем сам предмет
+        await session.execute(text("DELETE FROM items WHERE id=:iid"), {"iid": ammo_item_id})
+        # и убираем из backpack
+        await session.execute(
+            text("""
+                UPDATE inventories
+                   SET backpack = array_remove(COALESCE(backpack,'{}'::uuid[]), CAST(:iid AS uuid))
+                 WHERE actor_id = :aid
+            """),
+            {"aid": actor_id, "iid": ammo_item_id}
+        )
+        return {"left": 0, "deleted": True}
+
+    # иначе просто минус 1
+    row2 = (await session.execute(
+        text("""
+            UPDATE items SET charges = charges - 1
+             WHERE id=:iid
+         RETURNING charges
+        """),
+        {"iid": ammo_item_id}
+    )).mappings().first()
+    return {"left": row2 and row2["charges"], "deleted": False}
+
+async def _actor_stat_from_meta(session, actor_id: str, key: str, default: int = 0) -> int:
+    row = (await session.execute(
+        text("SELECT meta FROM actors WHERE id=:aid"),
+        {"aid": actor_id}
+    )).mappings().first()
+    if not row:
+        return default
+    meta = row["meta"] or {}
+    try:
+        v = meta.get(key, default)
+        return int(v) if v is not None else default
+    except Exception:
+        return default
+
+
+
+
+async def perform_attack_db(session, attacker_id: str, target_id: str):
+    """
+    Выполняет фактическую атаку:
+      - проверяет LOS, дистанцию, max_range;
+      - бросает шанс попадания и крит;
+      - применяет урон и резисты;
+      - тратит заряд (charges) или патрон из рюкзака.
+    Возвращает {"ok":True, "events":[...]}.
+    """
+    import random
+    from sqlalchemy import text
+
+    events = []
+
+    # --- атакующий + оружие (берём из правой руки) ---
+    q = await session.execute(text("""
+        SELECT a.id AS aid, a.node_id, a.x, a.y, a.hp,
+               i.id AS item_id,
+               k.title AS weapon_title, k.weapon_class, k.damage_type,
+               k.opt_range, k.max_range, k.crit_chance, k.hit_bonus,
+               k.ammo_type, k.tags,
+               (k.props->>'damage')::int AS base_damage
+        FROM actors a
+        LEFT JOIN inventories inv ON inv.actor_id = a.id
+        LEFT JOIN items i         ON i.id = inv.right_item
+        LEFT JOIN item_kinds k    ON k.id = i.kind_id
+        WHERE a.id = :aid
+    """), {"aid": attacker_id})
+    atk = q.mappings().first()
+    if not atk or not atk["item_id"]:
+        return {"ok": True, "events": [{"type": "NO_WEAPON", "payload": {}}]}
+
+    weapon  = atk
+    item_id = weapon["item_id"]
+
+    # --- цель ---
+    tq = await session.execute(
+        text("SELECT id, node_id, x, y, hp, resistances FROM actors WHERE id=:tid"),
+        {"tid": target_id}
+    )
+    tgt = tq.mappings().first()
+    if not tgt:
+        return {"ok": False, "error": "target_not_found"}
+
+    # --- геометрия ---
+    dx = abs(atk["x"] - tgt["x"])
+    dy = abs(atk["y"] - tgt["y"])
+    dist = max(dx, dy)
+    aligned = (dx == 0 or dy == 0 or dx == dy)
+
+    # --- линия обзора ---
+    los = await check_los(session, atk["node_id"], atk["x"], atk["y"], tgt["x"], tgt["y"])
+    if not los:
+        return {"ok": True, "events": [
+            {"type": "ATTACK_START", "payload": {
+                "attacker": attacker_id, "target": target_id,
+                "weapon": {"title": weapon["weapon_title"], "class": weapon["weapon_class"], "damage_type": weapon["damage_type"]},
+                "distance": dist, "aligned": aligned, "los": False
+            }},
+            {"type": "LOS_BLOCKED", "payload": {}}
+        ]}
+
+    # --- проверка максимальной дальности (до расхода боезапаса!) ---
+    max_r = int(weapon["max_range"] or 0)
+    if max_r > 0 and dist > max_r:
+        return {"ok": True, "events": [
+            {"type": "ATTACK_START", "payload": {
+                "attacker": attacker_id, "target": target_id,
+                "weapon": {"title": weapon["weapon_title"], "class": weapon["weapon_class"], "damage_type": weapon["damage_type"]},
+                "distance": dist, "aligned": aligned, "los": True
+            }},
+            {"type": "ATTACK_OUT_OF_RANGE", "payload": {"max_range": max_r}}
+        ]}
+
+    # --- правило ближнего боя: только соседняя клетка ---
+    if (weapon["weapon_class"] or "").lower() == "melee":
+        if dist != 1:
+            return {"ok": True, "events": [
+                {"type": "ATTACK_START", "payload": {
+                    "attacker": attacker_id, "target": target_id,
+                    "weapon": {"title": weapon["weapon_title"], "class": weapon["weapon_class"], "damage_type": weapon["damage_type"]},
+                    "distance": dist, "aligned": aligned, "los": True
+                }},
+                {"type": "ATTACK_OUT_OF_RANGE", "payload": {"reason": "melee_requires_adjacent", "required": 1}}
+            ]}
+
+    # --- проверка боезапаса/заряда ---
+    spent_ev = empty_ev = hint_ev = None
+
+    cur_ch = await _get_item_charges(session, item_id)
+    if cur_ch is not None:
+        # у оружия собственные charges
+        if (cur_ch or 0) <= 0:
+            await session.rollback()
+            return {"ok": True, "events": [
+                {"type": "ATTACK_START", "payload": {
+                    "attacker": attacker_id, "target": target_id,
+                    "weapon": {"title": weapon["weapon_title"], "class": weapon["weapon_class"], "damage_type": weapon["damage_type"]},
+                    "distance": dist, "aligned": aligned, "los": True
+                }},
+                {"type": "NO_AMMO", "payload": {}}
+            ]}
+        left = await _spend_one_charge(session, item_id)
+        spent_ev = {"type": "CONSUME", "payload": {"item": weapon["weapon_title"], "delta": -1, "left": left}}
+        if left == 0:
+            empty_ev = {"type": "AMMO_EMPTY", "payload": {}}
+            hint_ev  = {"type": "RELOAD_HINT", "payload": {"endpoint": "/inventory/reload"}}
+    else:
+        # у оружия НЕТ своих charges -> пробуем ammo_type из рюкзака
+        weapon_ammo = await _weapon_ammo_type_for_item(session, item_id)
+        if weapon_ammo:
+            ammo = await _find_ammo_in_backpack(session, attacker_id, weapon_ammo)
+            if not ammo:
+                await session.rollback()
+                return {"ok": True, "events": [
+                    {"type": "ATTACK_START", "payload": {
+                        "attacker": attacker_id, "target": target_id,
+                        "weapon": {"title": weapon["weapon_title"], "class": weapon["weapon_class"], "damage_type": weapon["damage_type"]},
+                        "distance": dist, "aligned": aligned, "los": True
+                    }},
+                    {"type": "NO_AMMO", "payload": {"ammo_type": weapon_ammo}}
+                ]}
+            result  = await _consume_one_ammo_from_backpack(session, attacker_id, ammo["id"])
+            spent_ev = {"type": "AMMO_CONSUME", "payload": {"ammo_title": ammo["title"], "delta": -1, "left": result["left"]}}
+            if result["deleted"]:
+                empty_ev = {"type": "AMMO_DEPLETED", "payload": {"ammo_title": ammo["title"]}}
+
+    # --- старт атаки ---
+    events.append({
+        "type": "ATTACK_START",
+        "payload": {
+            "attacker": attacker_id, "target": target_id,
+            "weapon": {"title": weapon["weapon_title"], "class": weapon["weapon_class"], "damage_type": weapon["damage_type"]},
+            "distance": dist, "aligned": aligned, "los": True
+        }
+    })
+    if spent_ev: events.append(spent_ev)
+    if empty_ev: events.append(empty_ev)
+    if hint_ev:  events.append(hint_ev)
+
+    # --- ТОЧНОСТЬ (с модификаторами и статами из meta) ---
+    accuracy = 100
+    mods = {}
+
+    if not aligned:
+        mods["angle_penalty"] = -30
+        accuracy -= 30
+
+    opt_r = int(weapon["opt_range"] or 0)
+    range_penalty = max(0, dist - opt_r) * 5
+    if range_penalty:
+        mods["range_penalty"] = -range_penalty
+        accuracy -= range_penalty
+
+    if weapon["hit_bonus"]:
+        mods["weapon_hit_bonus"] = int(weapon["hit_bonus"])
+        accuracy += int(weapon["hit_bonus"])
+
+    # --- штраф "слишком близко" только для луков (ammo_type='arrow' или тег 'bow') ---
+    tags = weapon.get("tags") or []
+    is_bow = (str(weapon.get("ammo_type") or "").lower() == "arrow") or ("bow" in [t.lower() for t in (tags or [])])
+    min_r = int(weapon.get("min_range") or 0)
+    if is_bow and min_r > 0 and (weapon.get("weapon_class") or "").lower() == "ranged":
+        if dist < min_r:
+            close_pen = (min_r - dist) * int(weapon.get("near_penalty") or 10)
+            if close_pen > 0:
+                mods["near_penalty"] = -close_pen
+                accuracy -= close_pen
+
+    # acc_bonus (атакующий) и evasion (цель) из actors.meta
+    atk_acc = await _actor_stat_from_meta(session, attacker_id, "acc_bonus", 0)
+    tgt_eva = await _actor_stat_from_meta(session, target_id,   "evasion",   0)
+    if atk_acc:
+        mods["acc_bonus"] = int(atk_acc); accuracy += int(atk_acc)
+    if tgt_eva:
+        mods["evasion"] = -int(tgt_eva);  accuracy -= int(tgt_eva)
+
+    # диапазон 5..95 (всегда шанс попасть/промахнуться)
+    accuracy = max(5, min(95, accuracy))
+
+    roll = random.randint(1, 100)
+    events.append({"type": "HIT_ROLL", "payload": {"accuracy": accuracy, "roll": roll, "mods": mods}})
+
+    if roll > accuracy:
+        events.append({"type": "ATTACK_MISS", "payload": {}})
+        await session.commit()
+        return {"ok": True, "events": events}
+
+    # --- базовый урон ---
+    base = weapon["base_damage"] or 5
+
+    # crit_mult из props (дефолт 2.0)
+    crit_mult = 2.0
+    try:
+        row_props = (await session.execute(
+            text("SELECT k.props FROM item_kinds k JOIN items i ON i.kind_id = k.id WHERE i.id = :iid"),
+            {"iid": item_id}
+        )).mappings().first()
+        if row_props:
+            props = row_props.get("props") or {}
+            if isinstance(props, dict):
+                cm = props.get("crit_mult")
+                if cm is not None:
+                    crit_mult = float(cm)
+    except Exception:
+        pass
+
+    # --- крит ---
+    crit = roll <= (weapon["crit_chance"] or 0)
+    if crit:
+        base = int(round(base * crit_mult))
+        events.append({"type": "ATTACK_CRIT", "payload": {
+            "crit_chance": weapon["crit_chance"],
+            "crit_mult": crit_mult
+        }})
+
+    # --- сопротивление цели ---
+    dmg_type = weapon["damage_type"] or "physical"
+    resist_mod = 1.0
+    if tgt["resistances"]:
+        mod = tgt["resistances"].get(dmg_type)
+        if mod is not None:
+            resist_mod = float(mod)
+
+    events.append({"type": "RESIST_APPLY", "payload": {"damage_type": dmg_type, "resist_mod": resist_mod}})
+
+    final_dmg = max(1, int(base * resist_mod))  # минимум 1 при попадании
+    events.append({"type": "DAMAGE_APPLY", "payload": {"base": base, "final": final_dmg}})
+
+    await session.execute(
+        text("UPDATE actors SET hp = GREATEST(hp - :dmg, 0) WHERE id=:tid"),
+        {"tid": target_id, "dmg": final_dmg}
+    )
+
+    events.append({"type": "ATTACK_HIT", "payload": {}})
+
+    # --- смерть цели ---
+    nhp = (await session.execute(text("SELECT hp FROM actors WHERE id=:tid"), {"tid": target_id})).scalar_one()
+    if nhp <= 0:
+        events.append({"type": "DEATH", "payload": {"target": target_id}})
+
+    await session.commit()
+    return {"ok": True, "events": events}
