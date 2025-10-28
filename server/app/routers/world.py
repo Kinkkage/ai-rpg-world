@@ -3,16 +3,22 @@ import json
 import uuid
 import random
 from typing import List, Dict, Any, Optional
+
 from fastapi import APIRouter, Depends, Query, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 
 from app.db import get_session
+# Новые DAO для генерации мира (глава 14)
+from app.services.dao_worldgen import spawn_node_db, spawn_route_db, get_world_map_db
 
 router = APIRouter(prefix="/world", tags=["world"])
 
 
+# ─────────────────────────────────────────────────────────
+# СТАРЫЕ МОДЕЛИ/ЭНДПОИНТЫ (оставляем для совместимости)
+# ─────────────────────────────────────────────────────────
 class SpawnRouteRequest(BaseModel):
     name: str = "new_zone"
     theme: str = "forest_path"
@@ -29,6 +35,10 @@ class SpawnRouteResponse(BaseModel):
 
 @router.post("/spawn_route", response_model=SpawnRouteResponse)
 async def spawn_route(data: SpawnRouteRequest, session: AsyncSession = Depends(get_session)):
+    """
+    УСТАРЕВШИЙ вариант генерации (оставлен для совместимости клиента).
+    Новый — см. POST /world/spawn_node и /world/spawn_route2.
+    """
     name = data.name
     theme = data.theme
     width, height = (data.size[0], data.size[1]) if len(data.size) == 2 else (16, 16)
@@ -52,7 +62,7 @@ async def spawn_route(data: SpawnRouteRequest, session: AsyncSession = Depends(g
 
     content: Dict[str, Any] = {"name": name, "theme": theme, "terrain": terrain}
 
-    # ВСТАВКА УЗЛА (под твою схему из скрина)
+    # ВСТАВКА УЗЛА (под текущую схему)
     await session.execute(
         text("""
             INSERT INTO nodes (id, title, biome, exits, width, height, content, size_w, size_h, description)
@@ -98,7 +108,7 @@ async def spawn_route(data: SpawnRouteRequest, session: AsyncSession = Depends(g
     return SpawnRouteResponse(ok=True, node_id=node_id, size=[width, height], npcs=spawned_npcs)
 
 
-# ---------- ОТЛАДОЧНЫЕ ЭНДПОИНТЫ ----------
+# ---------- ОТЛАДОЧНЫЕ ЭНДПОИНТЫ (как были) ----------
 
 @router.get("/nodes")
 async def list_nodes(
@@ -176,3 +186,70 @@ async def node_raw(node_id: str, session: AsyncSession = Depends(get_session)):
         "content_keys": list((row["content"] or {}).keys()) if isinstance(row["content"], dict) else ["terrain?"],
         "description": row["description"],
     }
+
+
+# ─────────────────────────────────────────────────────────
+# НОВЫЕ ЭНДПОИНТЫ ГЛАВЫ 14
+# ─────────────────────────────────────────────────────────
+
+class SpawnNodeReq(BaseModel):
+    node_id: str
+    biome: Optional[str] = None
+    difficulty: Optional[int] = 1
+    seed: Optional[str] = None
+    size: Optional[List[int]] = [16, 16]
+
+
+@router.post("/spawn_node")
+async def spawn_node_api(data: SpawnNodeReq, session: AsyncSession = Depends(get_session)):
+    """
+    Генерирует содержимое указанного узла (terrain/loot/NPC/POI) по правилам биома
+    детерминированно от seed. Узел должен существовать в nodes.
+    """
+    size = tuple(data.size or [16, 16])
+    res = await spawn_node_db(
+        session,
+        data.node_id,
+        biome=(data.biome or "forest"),
+        difficulty=int(data.difficulty or 1),
+        seed=data.seed,
+        size=size,
+    )
+    return {"ok": True, **res}
+
+
+class SpawnRouteV2Req(BaseModel):
+    from_node: str
+    dir: str
+    target_biome: Optional[str] = None
+    target_difficulty: Optional[int] = None
+    seed: Optional[str] = None
+    size: Optional[List[int]] = [16, 16]
+
+
+@router.post("/spawn_route2")
+async def spawn_route_v2(data: SpawnRouteV2Req, session: AsyncSession = Depends(get_session)):
+    """
+    Создаёт (если не существует) узел по направлению от from_node, связывает двусторонне,
+    генерирует его содержимое и возвращает JSON узла. Если выход уже есть — просто возвращает его.
+    """
+    size = tuple(data.size or [16, 16])
+    res = await spawn_route_db(
+        session,
+        from_node=data.from_node,
+        dir=data.dir,
+        target_biome=data.target_biome,
+        target_difficulty=data.target_difficulty,
+        seed=data.seed,
+        size=size,
+    )
+    return {"ok": True, **res}
+
+
+@router.get("/map")
+async def world_map(session: AsyncSession = Depends(get_session)):
+    """
+    Мини-карта мира: {nodes: [...], edges: [...]}
+    """
+    res = await get_world_map_db(session)
+    return {"ok": True, **res}
