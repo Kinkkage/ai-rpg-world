@@ -1,7 +1,7 @@
 # server/app/dao.py
 from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import text, bindparam
+from sqlalchemy import text as sa_text, bindparam
 from sqlalchemy.dialects.postgresql import UUID, ARRAY, JSONB
 import json
 
@@ -2461,3 +2461,686 @@ async def perform_attack_db(session, attacker_id: str, target_id: str):
 
     await session.commit()
     return {"ok": True, "events": events}
+
+# ===================== CRAFT (PLAN + EXECUTE) =====================
+import re
+from uuid import UUID as _UUID
+
+# --- Небольшой словарик: распознаём цель и требуемые теги
+_CRAFT_KEYWORDS = [
+    # text_contains -> (target_kind, craft_level, required_tags)
+    (r"электрошокер|шокер|shock", "shock_device", 2, ["power_source", "wire", "conductive", "insulator"]),
+    (r"факел|torch",              "torch_basic",  1, ["wood", "fabric", "flammable"]),
+    (r"копь[ье]|spear",           "spear_basic",  1, ["wood", "blade"]),
+]
+
+def _infer_recipe_from_text(text: str):
+    t = (text or "").lower()
+    for pat, kind, lvl, tags in _CRAFT_KEYWORDS:
+        if re.search(pat, t):
+            return {"target_kind": kind, "level": lvl, "required_tags": tags}
+    # дефолт: "самодельная штука" — просим хотя бы 2 предмета-“компонента”
+    return {"target_kind": "improv_device", "level": 1, "required_tags": ["components", "components"]}
+
+async def _gather_actor_items(session: AsyncSession, actor_id: str):
+    """
+    Собираем все доступные предметы игрока с источником:
+    - left/right (руки),
+    - backpack (uuid[] массив),
+    - equipped bag grid,
+    - hand-held bag grids (если мешок в руке).
+    Вернём список словарей: {item_id, kind_id, tags[], source:{kind,...}}
+    """
+    inv = (
+        await session.execute(
+            text("""SELECT left_item, right_item, hidden_slot, equipped_bag, backpack
+                    FROM inventories WHERE actor_id=:aid"""),
+            {"aid": actor_id}
+        )
+    ).mappings().first()
+    if not inv:
+        return []
+
+    items: List[Dict[str, Any]] = []
+
+    async def _append_item(iid, source):
+        if not iid:
+            return
+        row = (
+            await session.execute(
+                text("""SELECT i.id, i.kind_id, COALESCE(k.tags,'{}'::text[]) AS tags
+                        FROM items i JOIN item_kinds k ON k.id=i.kind_id
+                        WHERE i.id=:iid"""),
+                {"iid": iid}
+            )
+        ).mappings().first()
+        if row:
+            d = dict(row)
+            d["tags"] = list(d["tags"] or [])
+            d["source"] = source
+            items.append(d)
+
+    # руки
+    if inv["left_item"]:
+        await _append_item(inv["left_item"], {"place": "left"})
+    if inv["right_item"]:
+        await _append_item(inv["right_item"], {"place": "right"})
+
+    # backpack (массив)
+    for iid in (inv["backpack"] or []):
+        await _append_item(iid, {"place": "backpack"})
+
+    # грид надетого рюкзака
+    equipped_bag = inv["equipped_bag"]
+    handheld_containers: List[str] = []
+    for place in ("left_item", "right_item"):
+        if inv[place]:
+            # проверим, контейнер ли
+            rc = (
+                await session.execute(
+                    text("""SELECT COALESCE(k.grid_w,0) gw, COALESCE(k.grid_h,0) gh
+                            FROM items i JOIN item_kinds k ON k.id=i.kind_id
+                            WHERE i.id=:iid"""),
+                    {"iid": inv[place]}
+                )
+            ).mappings().first()
+            if rc and int(rc["gw"]) > 0 and int(rc["gh"]) > 0:
+                handheld_containers.append(str(inv[place]))
+
+    container_ids: List[str] = []
+    if equipped_bag:
+        container_ids.append(str(equipped_bag))
+    container_ids.extend(handheld_containers)
+
+    if container_ids:
+        rows = (
+            await session.execute(
+                text("""SELECT container_item_id, slot_x, slot_y, item_id
+                        FROM carried_container_slots
+                        WHERE container_item_id = ANY(:cids)""")
+                .bindparams(bindparam("cids", value=container_ids, type_=ARRAY(UUID(as_uuid=True))))
+            )
+        ).mappings().all()
+        for r in rows:
+            await _append_item(
+                r["item_id"],
+                {
+                    "place": "grid",
+                    "container_id": str(r["container_item_id"]),
+                    "slot": {"x": int(r["slot_x"]), "y": int(r["slot_y"])}
+                }
+            )
+
+    return items
+
+def _cover_required_tags(required: List[str], candidates: List[Dict[str, Any]]):
+    """
+    Жадный матч по тегам. Один предмет может закрывать несколько тегов.
+    Возвращает:
+      chosen: [{item_id, source, covers:[tag,...]}]
+      missing: [tag,...]
+    """
+    req = list(required)
+    chosen: List[Dict[str, Any]] = []
+    covered: Dict[str, str] = {}
+    # сортируем: чем больше тегов у предмета, тем раньше пробуем
+    sorted_cands = sorted(candidates, key=lambda c: -(len(c.get("tags") or [])))
+    for cand in sorted_cands:
+        can_cover = [t for t in req if t in (cand.get("tags") or []) and t not in covered]
+        if can_cover:
+            chosen.append({"item_id": str(cand["id"]) if "id" in cand else str(cand.get("item_id", "")),
+                           "source": cand["source"], "covers": can_cover})
+            for t in can_cover:
+                covered[t] = cand
+        if len(covered) == len(req):
+            break
+    missing = [t for t in req if t not in covered]
+    return chosen, missing
+
+# ─── ЕДИНЫЙ хелпер уровня навыка (совместим с вашей старой системой) ─────────
+# Пытается найти максимум по шаблону "{base}_lvlN" (N=0..8) в skills/actor_skills.
+# Если уровневых записей нет — мягко фолбэкается на actor_knows_skill(base).
+# Возвращает целое 0..8.
+async def _skill_level(session: AsyncSession, actor_id: str, base: str) -> int:
+    # 1) пробуем уровневую схему: crafting_lvl0..8, electronics_lvl0..8
+    rows = (
+        await session.execute(
+            text("""
+                SELECT s.id
+                  FROM actor_skills a
+                  JOIN skills s ON s.id = a.skill_id
+                 WHERE a.actor_id = :aid
+                   AND s.id ILIKE :prefix
+            """),
+            {"aid": actor_id, "prefix": f"{base}_lvl%"},
+        )
+    ).mappings().all()
+
+    level = 0
+    for r in rows:
+        sid = (r["id"] or "").strip().lower()
+        if "_lvl" in sid:
+            try:
+                n = int(sid.rsplit("_lvl", 1)[1])
+                if 0 <= n <= 8:
+                    level = max(level, n)
+            except Exception:
+                pass
+
+    if level > 0:
+        return level  # нашли уровни — отлично
+
+    # 2) фолбэк на старую бинарную систему (есть/нет)
+    try:
+        has = await actor_knows_skill(session, actor_id, base)
+    except Exception:
+        has = False
+    return 1 if has else 0
+
+
+async def craft_plan_db(
+    session: AsyncSession,
+    actor_id: str,
+    text: str,
+    station_object_id: Optional[str] = None,
+):
+    """
+    План крафта:
+    - парсим пожелание игрока -> (target_kind, required_tags, level)
+    - собираем кандидатов из инвентаря
+    - матчим теги
+    - учитываем навыки и наличие станции
+    - оцениваем качество (quality_estimate) для UI/LLM
+    """
+    # 1) что хотим сделать?
+    rec = _infer_recipe_from_text(text)
+    required = rec["required_tags"]
+    target_kind = rec["target_kind"]
+    craft_level = rec["level"]
+
+    # 2) сбор кандидатов
+    cands = await _gather_actor_items(session, actor_id)
+
+    # 3) матч по тегам
+    chosen, missing = _cover_required_tags(required, cands)
+
+    # 4) навыки (уровневая + бинарная система через _skill_level)
+    need_skill = 1 if craft_level >= 2 else 0
+    have_crafting = await _skill_level(session, actor_id, "crafting")
+    have_electro  = await _skill_level(session, actor_id, "electronics")
+    have_skill = max(have_crafting, have_electro)
+
+    # 5) станция
+    if station_object_id:
+        has_station, station_type = True, "workbench"
+    else:
+        has_station, station_type = await get_station_at(session, actor_id)
+
+    # 6) оценка качества
+    quality_estimate = estimate_quality(
+        craft_level=craft_level,
+        have_skill=have_skill,
+        need_skill=need_skill,
+        has_station=has_station,
+    )
+
+    # 7) заметки
+    notes = []
+    if missing:
+        notes.append("Не хватает: " + ", ".join(missing))
+    if craft_level >= 2 and not has_station:
+        notes.append("Нужна станция (верстак) или будет сложно.")
+
+    # 8) итог
+    return {
+        "ok": True,
+        "plan": {
+            "target_kind": target_kind,
+            "craft_level": craft_level,
+            "required_tags": required,
+            "chosen": chosen,
+            "missing": missing,
+            "skill": {"need": need_skill, "have": have_skill},
+            "station": has_station,
+            "station_type": station_type,
+            "quality_estimate": quality_estimate,
+            "notes": "; ".join(notes) if notes else "",
+        },
+    }
+
+
+
+async def _remove_item_from_source(session: AsyncSession, actor_id: str, item_id: str, source: Dict[str, Any]):
+    place = source.get("place")
+    if place == "backpack":
+        await session.execute(
+            text("""UPDATE inventories
+                    SET backpack = array_remove(coalesce(backpack,'{}'::uuid[]), CAST(:iid AS uuid))
+                    WHERE actor_id=:aid"""),
+            {"aid": actor_id, "iid": item_id}
+        )
+    elif place == "left":
+        await session.execute(text("""UPDATE inventories SET left_item=NULL WHERE actor_id=:aid"""), {"aid": actor_id})
+    elif place == "right":
+        await session.execute(text("""UPDATE inventories SET right_item=NULL WHERE actor_id=:aid"""), {"aid": actor_id})
+    elif place == "grid":
+        # нужно удалить запись слота
+        cid = source.get("container_id")
+        slot = source.get("slot") or {}
+        await session.execute(
+            text("""DELETE FROM carried_container_slots
+                    WHERE container_item_id=CAST(:cid AS uuid)
+                      AND slot_x=:x AND slot_y=:y AND item_id=CAST(:iid AS uuid)"""),
+            {"cid": cid, "x": int(slot.get("x", 0)), "y": int(slot.get("y", 0)), "iid": item_id}
+        )
+    else:
+        # hidden и прочие — не трогаем в крафте
+        raise ValueError("unsupported_source")
+
+async def _create_item(session: AsyncSession, kind_id: str) -> str:
+    """
+    Создаёт новый предмет указанного вида. Если в item_kinds.props заданы дефолты
+    для charges/durability, инициализируем ими fields.
+    """
+    # 1) узнаём props вида
+    krow = (
+        await session.execute(
+            text("""SELECT props FROM item_kinds WHERE id = :kid"""),
+            {"kid": kind_id},
+        )
+    ).mappings().first()
+
+    props = (krow and krow.get("props")) or {}
+    charges_cfg = (props or {}).get("charges") or {}
+    dura_cfg = (props or {}).get("durability") or {}
+
+    start_charges = charges_cfg.get("start", charges_cfg.get("max"))
+    start_dura = dura_cfg.get("start", dura_cfg.get("max"))
+
+    # 2) создаём предмет (пока без значений)
+    row = (
+        await session.execute(
+            text("""INSERT INTO items (kind_id) VALUES (:k) RETURNING id"""),
+            {"k": kind_id},
+        )
+    ).mappings().first()
+    iid = str(row["id"])
+
+    # 3) инициализируем charges/durability если заданы
+    if isinstance(start_charges, int):
+        await session.execute(
+            text("""UPDATE items SET charges = :c WHERE id = :iid"""),
+            {"c": start_charges, "iid": iid},
+        )
+    if isinstance(start_dura, int):
+        await session.execute(
+            text("""UPDATE items SET durability = :d WHERE id = :iid"""),
+            {"d": start_dura, "iid": iid},
+        )
+
+    return iid
+
+
+async def _try_place_result(session: AsyncSession, actor_id: str, new_item_id: str):
+    """Пытаемся положить результат: левая рука -> правая -> грид надетого рюкзака -> массив backpack -> дроп на землю."""
+    inv = (
+        await session.execute(
+            text("""SELECT left_item,right_item,equipped_bag,backpack FROM inventories WHERE actor_id=:aid"""),
+            {"aid": actor_id}
+        )
+    ).mappings().first()
+    if not inv:
+        return {"placed": "none"}
+
+    # левая
+    if not inv["left_item"]:
+        await session.execute(
+            text("""UPDATE inventories SET left_item=CAST(:iid AS uuid) WHERE actor_id=:aid"""),
+            {"iid": new_item_id, "aid": actor_id}
+        )
+        return {"placed": "left"}
+
+    # правая
+    if not inv["right_item"]:
+        await session.execute(
+            text("""UPDATE inventories SET right_item=CAST(:iid AS uuid) WHERE actor_id=:aid"""),
+            {"iid": new_item_id, "aid": actor_id}
+        )
+        return {"placed": "right"}
+
+    # грид надетого рюкзака
+    if inv["equipped_bag"]:
+        # найдём первый свободный слот
+        cont = (
+            await session.execute(
+                text("""SELECT COALESCE(k.grid_w,0) gw, COALESCE(k.grid_h,0) gh
+                        FROM items i JOIN item_kinds k ON k.id=i.kind_id
+                        WHERE i.id=:cid"""),
+                {"cid": inv["equipped_bag"]}
+            )
+        ).mappings().first()
+        if cont and int(cont["gw"])>0 and int(cont["gh"])>0:
+            gw, gh = int(cont["gw"]), int(cont["gh"])
+            occupied = (
+                await session.execute(
+                    text("""SELECT slot_x,slot_y FROM carried_container_slots
+                            WHERE container_item_id=:cid"""),
+                    {"cid": inv["equipped_bag"]}
+                )
+            ).mappings().all()
+            occ = {(r["slot_x"], r["slot_y"]) for r in occupied}
+            for y in range(gh):
+                for x in range(gw):
+                    if (x,y) not in occ:
+                        await session.execute(
+                            text("""INSERT INTO carried_container_slots(container_item_id,slot_x,slot_y,item_id)
+                                    VALUES (CAST(:cid AS uuid), :x, :y, CAST(:iid AS uuid))"""),
+                            {"cid": inv["equipped_bag"], "x": x, "y": y, "iid": new_item_id}
+                        )
+                        return {"placed": "equipped_bag_grid", "x": x, "y": y}
+
+    # массив backpack
+    await session.execute(
+        text("""UPDATE inventories
+                SET backpack = array_append(coalesce(backpack,'{}'::uuid[]), CAST(:iid AS uuid))
+                WHERE actor_id=:aid"""),
+        {"aid": actor_id, "iid": new_item_id}
+    )
+    return {"placed": "backpack"}
+# ── CRAFT: STATION & QUALITY helpers ─────────────────────────────────────────
+
+async def get_station_at(session: AsyncSession, actor_id: str) -> tuple[bool, Optional[str]]:
+    """
+    Смотрим, стоит ли актёр рядом со станцией. Возвращает (есть_станция, тип_станции|None).
+    Станцией считаем node_object, у которого props->>'station' не NULL и клетка
+    совпадает с позицией актёра или по соседству (манхэттен<=1).
+    """
+    # позиция актёра (у тебя похожий запрос используется, см. выборку node_id,x,y: :contentReference[oaicite:2]{index=2})
+    pos = (
+        await session.execute(
+            text("""SELECT node_id, COALESCE(x,0) AS x, COALESCE(y,0) AS y
+                    FROM actors WHERE id=:aid"""),
+            {"aid": actor_id}
+        )
+    ).mappings().first()
+    if not pos or not pos["node_id"]:
+        return (False, None)
+
+    node_id, ax, ay = pos["node_id"], int(pos["x"]), int(pos["y"])
+
+    rows = (
+        await session.execute(
+            text("""
+                SELECT props->>'station' AS station, x, y
+                  FROM node_objects
+                 WHERE node_id = :nid
+                   AND props ? 'station'
+            """),
+            {"nid": node_id}
+        )
+    ).mappings().all()
+
+    for r in rows:
+        sx, sy = int(r["x"]), int(r["y"])
+        if abs(sx - ax) + abs(sy - ay) <= 1:
+            return (True, r["station"] or None)
+
+    return (False, None)
+
+
+def estimate_quality(craft_level: int, have_skill: int, need_skill: int, has_station: bool) -> dict:
+    """
+    Грубая оценка качества результата. Возвращаем словарь, чтобы его можно было
+    отдать клиенту и/или применить в execute.
+    """
+    base = 1.0
+    # штраф за сложность без станции
+    if craft_level >= 2 and not has_station:
+        base -= 0.25
+    # недобор по навыку
+    if have_skill < need_skill:
+        base -= 0.25
+    # заглушка: границы 0.25..1.25
+    base = max(0.25, min(1.25, base))
+
+    # в качестве «понятной цифры» дадим и прогноз зарядов-модификаторов
+    charges_bonus = 0
+    if base >= 1.1:
+        charges_bonus = +1
+    elif base <= 0.5:
+        charges_bonus = -1
+
+    return {"score": round(base, 2), "charges_bonus": charges_bonus}
+# ─────────────────────────────────────────────────────────────────────────────
+# CRAFT: EXECUTE + helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def craft_execute_db(session: AsyncSession, actor_id: str, plan: Dict[str, Any], confirm: bool = True):
+    """
+    Выполняет крафт по плану.
+    Поддерживаем два формата chosen:
+      1) [{item_id, source, covers:[...]}]     ← как вернул /craft/plan
+      2) [{tag, item_id}]                      ← ручной формат
+    Возвращает созданный item и место, куда он положен.
+    """
+    if not confirm:
+        return {"ok": False, "error": "not_confirmed"}
+
+    if not plan or not plan.get("target_kind"):
+        return {"ok": False, "error": "bad_plan"}
+
+    target_kind: str = plan["target_kind"]
+    required: List[str] = list(plan.get("required_tags") or [])
+    chosen_input: List[Dict[str, Any]] = list(plan.get("chosen") or [])
+
+    # --- нормализуем chosen в вид: {item_id, covers:[...], source?:{...}} ---
+    normalized_chosen: List[Dict[str, Any]] = []
+    covered: set = set()
+
+    for ch in chosen_input:
+        iid = ch.get("item_id")
+        if not iid:
+            return {"ok": False, "error": "bad_plan_item"}
+
+        # формат 1: есть covers:[...]
+        if isinstance(ch.get("covers"), list):
+            covers = [str(t) for t in ch["covers"]]
+            src = ch.get("source") or {}
+        # формат 2: ручной — одна пара tag+item_id
+        elif "tag" in ch and isinstance(ch["tag"], str):
+            covers = [ch["tag"]]
+            src = ch.get("source") or {}
+        else:
+            covers = []
+            src = ch.get("source") or {}
+
+        for t in covers:
+            covered.add(t)
+
+        normalized_chosen.append({"item_id": iid, "covers": covers, "source": src})
+
+    # --- проверим, что все required закрыты ---
+    missing = [t for t in required if t not in covered]
+    if missing:
+        return {"ok": False, "error": "missing_requirements", "missing": missing}
+
+    # --- проверка принадлежности каждого выбранного предмета ---
+    for ch in normalized_chosen:
+        iid = ch["item_id"]
+        src = ch["source"]
+        place = (src or {}).get("place")
+        owned_ok = False
+
+        if place == "backpack":
+            owned_ok = (
+                await session.execute(
+                    text("""SELECT CAST(:iid AS uuid) = ANY(coalesce(backpack,'{}'::uuid[])) AS ok
+                              FROM inventories WHERE actor_id=:aid"""),
+                    {"iid": iid, "aid": actor_id},
+                )
+            ).scalar() or False
+
+        elif place in ("left", "right"):
+            col = "left_item" if place == "left" else "right_item"
+            owned_ok = (
+                await session.execute(
+                    text(f"""SELECT ({col} = CAST(:iid AS uuid)) AS ok
+                               FROM inventories WHERE actor_id=:aid"""),
+                    {"iid": iid, "aid": actor_id},
+                )
+            ).scalar() or False
+
+        elif place == "grid":
+            cid = src.get("container_id")
+            slot = src.get("slot") or {}
+            owned_ok = (
+                await session.execute(
+                    text("""SELECT 1 FROM carried_container_slots
+                             WHERE container_item_id = CAST(:cid AS uuid)
+                               AND slot_x = :x AND slot_y = :y
+                               AND item_id = CAST(:iid AS uuid)
+                             LIMIT 1"""),
+                    {"cid": cid, "x": int(slot.get("x", 0)), "y": int(slot.get("y", 0)), "iid": iid},
+                )
+            ).first() is not None
+
+        else:
+            return {"ok": False, "error": "unsupported_source"}
+
+        if not owned_ok:
+            return {"ok": False, "error": "consume_conflict", "item_id": iid, "source": src}
+
+    # --- списываем предметы из их источников (в транзакции) ---
+    for ch in normalized_chosen:
+        await _remove_item_from_source(session, actor_id, ch["item_id"], ch["source"])
+
+    # --- создаём результат ---
+    new_item_id = await _create_item(session, target_kind)
+
+    # --- качество/заряды ---
+    # 1) Пытаемся взять оценку из плана
+    qe = plan.get("quality_estimate") or {}
+    # 2) Если в плане нет словаря с 'score', пересчитываем здесь
+    if not isinstance(qe, dict) or ("score" not in qe):
+        craft_level = int(plan.get("craft_level") or 1)
+        need_skill = 1 if craft_level >= 2 else 0
+
+        have_crafting = await _skill_level(session, actor_id, "crafting")
+        have_electro  = await _skill_level(session, actor_id, "electronics")
+        have_skill = max(have_crafting, have_electro)
+
+        has_station = bool(plan.get("station"))
+        if not has_station:
+            has_station, _ = await get_station_at(session, actor_id)
+
+        qe = estimate_quality(
+            craft_level=craft_level,
+            have_skill=have_skill,
+            need_skill=need_skill,
+            has_station=has_station,
+        )
+
+    q_score = float(qe.get("score") or 0.0)          # 0..1
+    charges_bonus = int(qe.get("charges_bonus") or 0)
+
+    # Базовые заряды (расширяй по мере появления видов)
+    base_charges_map = {
+        "shock_device": 3,
+    }
+    base_ch = base_charges_map.get(target_kind)
+    if base_ch is not None:
+        # q_score: 0 → 0.75×; 1 → 1.25×; середина 0.5 → 1.0×
+        factor = 0.75 + q_score * 0.50
+        final_charges = max(1, int(round(base_ch * factor)) + charges_bonus)
+
+        await session.execute(
+            text("""UPDATE items SET charges = :c WHERE id = :iid"""),
+            {"c": final_charges, "iid": new_item_id},
+        )
+
+    # --- кладём игроку ---
+    placed = await _try_place_result(session, actor_id, new_item_id)
+
+    await session.commit()
+    return {
+        "ok": True,
+        "created": {"item_id": new_item_id, "kind_id": target_kind},
+        "placed": placed,
+    }
+
+
+# ───────────────────────── helpers ─────────────────────────
+
+async def _remove_item_from_source(session: AsyncSession, actor_id: str, item_id: str, source: Dict[str, Any]) -> None:
+    """Снимает предмет из указанного источника у актёра."""
+    place = (source or {}).get("place")
+
+    if place == "backpack":
+        await session.execute(
+            text("""UPDATE inventories
+                       SET backpack = array_remove(coalesce(backpack,'{}'::uuid[]), CAST(:iid AS uuid))
+                     WHERE actor_id = :aid"""),
+            {"aid": actor_id, "iid": item_id},
+        )
+
+    elif place == "left":
+        await session.execute(
+            text("""UPDATE inventories
+                       SET left_item = NULL
+                     WHERE actor_id = :aid AND left_item = CAST(:iid AS uuid)"""),
+            {"aid": actor_id, "iid": item_id},
+        )
+
+    elif place == "right":
+        await session.execute(
+            text("""UPDATE inventories
+                       SET right_item = NULL
+                     WHERE actor_id = :aid AND right_item = CAST(:iid AS uuid)"""),
+            {"aid": actor_id, "iid": item_id},
+        )
+
+    elif place == "grid":
+        cid = source.get("container_id")
+        slot = source.get("slot") or {}
+        await session.execute(
+            text("""DELETE FROM carried_container_slots
+                     WHERE container_item_id = CAST(:cid AS uuid)
+                       AND slot_x = :x AND slot_y = :y
+                       AND item_id = CAST(:iid AS uuid)"""),
+            {"cid": cid, "x": int(slot.get("x", 0)), "y": int(slot.get("y", 0)), "iid": item_id},
+        )
+
+    else:
+        # fallback: если предмет вдруг "ничей", удалим сам item
+        await session.execute(
+            text("DELETE FROM items WHERE id = CAST(:iid AS uuid)"),
+            {"iid": item_id},
+        )
+
+
+async def _create_item(session: AsyncSession, kind_id: str) -> str:
+    """Создаёт новый предмет указанного вида и возвращает его id."""
+    row = (
+        await session.execute(
+            text("""INSERT INTO items (kind_id, charges, durability)
+                    VALUES (:k, NULL, NULL)
+                    RETURNING id"""),
+            {"k": kind_id},
+        )
+    ).mappings().first()
+    return str(row["id"])
+
+
+async def _try_place_result(session: AsyncSession, actor_id: str, item_id: str) -> Dict[str, Any]:
+    """
+    Кладём результат в backpack игрока (единое поведение как в проекте).
+    При желании можно расширить логикой: в свободную руку и т.п.
+    """
+    await session.execute(
+        text("""UPDATE inventories
+                   SET backpack = array_append(coalesce(backpack,'{}'::uuid[]), CAST(:iid AS uuid))
+                 WHERE actor_id = :aid"""),
+        {"aid": actor_id, "iid": item_id},
+    )
+    return {"place": "backpack", "item_id": str(item_id)}
+

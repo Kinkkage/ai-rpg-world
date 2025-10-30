@@ -13,6 +13,8 @@ from sqlalchemy import text, bindparam
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import JSONB  # UUID/ARRAY можно вернуть при необходимости
 from app.routers import trade as trade_router
+from app.routers import craft as craft_router
+
 
 # DB / DAO
 import random  # для вероятности наложения статуса
@@ -1469,6 +1471,7 @@ app.include_router(items_router)
 app.include_router(combat_router)
 app.include_router(npc_ai_router.router)
 app.include_router(trade_router.router)
+app.include_router(craft_router.router)
 # Health-check корень
 @app.get("/")
 async def root():
