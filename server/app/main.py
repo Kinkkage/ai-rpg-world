@@ -12,7 +12,9 @@ from pydantic import BaseModel
 from sqlalchemy import text, bindparam
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import JSONB  # UUID/ARRAY можно вернуть при необходимости
-
+from app.routers import skills as skills_router
+from app.routers import context as context_router
+from app.routers import do  
 # DB / DAO
 import random  # для вероятности наложения статуса
 from app.db import get_session
@@ -1464,6 +1466,9 @@ app.include_router(battle_router.router)   # боевой роутер
 app.include_router(inventory_router)
 app.include_router(items_router)
 app.include_router(combat_router)
+app.include_router(skills_router.router)
+app.include_router(context_router.router)
+app.include_router(do.router) 
 # Health-check корень
 @app.get("/")
 async def root():

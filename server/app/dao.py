@@ -4,6 +4,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text, bindparam
 from sqlalchemy.dialects.postgresql import UUID, ARRAY, JSONB
 import json
+from app.services.armor import effective_armor_level, apply_armor_reduction
+from app.services.status_mods import get_status_combat_mods
 
 
 # ===================== NODE =====================
@@ -2220,21 +2222,22 @@ async def _actor_stat_from_meta(session, actor_id: str, key: str, default: int =
 
 async def perform_attack_db(session, attacker_id: str, target_id: str):
     """
-    Выполняет фактическую атаку:
-      - проверяет LOS, дистанцию, max_range;
-      - бросает шанс попадания и крит;
-      - применяет урон и резисты;
-      - тратит заряд (charges) или патрон из рюкзака.
-    Возвращает {"ok":True, "events":[...]}.
+    Выполняет фактическую атаку (старая логика) + статусы/броня:
+      - LOS/дистанция/max_range
+      - боезапас
+      - бросок попадания/крит
+      - сопротивления цели
+      - броня цели (-10% за уровень 0..5) (+временный бонус от guard)
+      - статусные модификаторы: slow/guard/rage (простые и прозрачные)
     """
     import random
     from sqlalchemy import text
 
     events = []
 
-    # --- атакующий + оружие (берём из правой руки) ---
+    # --- атакующий + оружие (правая рука) ---
     q = await session.execute(text("""
-        SELECT a.id AS aid, a.node_id, a.x, a.y, a.hp,
+        SELECT a.id AS aid, a.node_id, a.x, a.y,
                i.id AS item_id,
                k.title AS weapon_title, k.weapon_class, k.damage_type,
                k.opt_range, k.max_range, k.crit_chance, k.hit_bonus,
@@ -2255,7 +2258,7 @@ async def perform_attack_db(session, attacker_id: str, target_id: str):
 
     # --- цель ---
     tq = await session.execute(
-        text("SELECT id, node_id, x, y, hp, resistances FROM actors WHERE id=:tid"),
+        text("SELECT id, node_id, x, y, resistances FROM actors WHERE id=:tid"),
         {"tid": target_id}
     )
     tgt = tq.mappings().first()
@@ -2280,7 +2283,7 @@ async def perform_attack_db(session, attacker_id: str, target_id: str):
             {"type": "LOS_BLOCKED", "payload": {}}
         ]}
 
-    # --- проверка максимальной дальности (до расхода боезапаса!) ---
+    # --- проверка максимальной дальности ---
     max_r = int(weapon["max_range"] or 0)
     if max_r > 0 and dist > max_r:
         return {"ok": True, "events": [
@@ -2292,24 +2295,21 @@ async def perform_attack_db(session, attacker_id: str, target_id: str):
             {"type": "ATTACK_OUT_OF_RANGE", "payload": {"max_range": max_r}}
         ]}
 
-    # --- правило ближнего боя: только соседняя клетка ---
-    if (weapon["weapon_class"] or "").lower() == "melee":
-        if dist != 1:
-            return {"ok": True, "events": [
-                {"type": "ATTACK_START", "payload": {
-                    "attacker": attacker_id, "target": target_id,
-                    "weapon": {"title": weapon["weapon_title"], "class": weapon["weapon_class"], "damage_type": weapon["damage_type"]},
-                    "distance": dist, "aligned": aligned, "los": True
-                }},
-                {"type": "ATTACK_OUT_OF_RANGE", "payload": {"reason": "melee_requires_adjacent", "required": 1}}
-            ]}
+    # --- правило ближнего боя: строго соседняя клетка ---
+    if (weapon["weapon_class"] or "").lower() == "melee" and dist != 1:
+        return {"ok": True, "events": [
+            {"type": "ATTACK_START", "payload": {
+                "attacker": attacker_id, "target": target_id,
+                "weapon": {"title": weapon["weapon_title"], "class": weapon["weapon_class"], "damage_type": weapon["damage_type"]},
+                "distance": dist, "aligned": aligned, "los": True
+            }},
+            {"type": "ATTACK_OUT_OF_RANGE", "payload": {"reason": "melee_requires_adjacent", "required": 1}}
+        ]}
 
-    # --- проверка боезапаса/заряда ---
+    # --- боезапас/заряды ---
     spent_ev = empty_ev = hint_ev = None
-
     cur_ch = await _get_item_charges(session, item_id)
     if cur_ch is not None:
-        # у оружия собственные charges
         if (cur_ch or 0) <= 0:
             await session.rollback()
             return {"ok": True, "events": [
@@ -2326,7 +2326,6 @@ async def perform_attack_db(session, attacker_id: str, target_id: str):
             empty_ev = {"type": "AMMO_EMPTY", "payload": {}}
             hint_ev  = {"type": "RELOAD_HINT", "payload": {"endpoint": "/inventory/reload"}}
     else:
-        # у оружия НЕТ своих charges -> пробуем ammo_type из рюкзака
         weapon_ammo = await _weapon_ammo_type_for_item(session, item_id)
         if weapon_ammo:
             ammo = await _find_ammo_in_backpack(session, attacker_id, weapon_ammo)
@@ -2358,7 +2357,7 @@ async def perform_attack_db(session, attacker_id: str, target_id: str):
     if empty_ev: events.append(empty_ev)
     if hint_ev:  events.append(hint_ev)
 
-    # --- ТОЧНОСТЬ (с модификаторами и статами из meta) ---
+    # --- ТОЧНОСТЬ + статус-модификаторы ---
     accuracy = 100
     mods = {}
 
@@ -2376,18 +2375,17 @@ async def perform_attack_db(session, attacker_id: str, target_id: str):
         mods["weapon_hit_bonus"] = int(weapon["hit_bonus"])
         accuracy += int(weapon["hit_bonus"])
 
-    # --- штраф "слишком близко" только для луков (ammo_type='arrow' или тег 'bow') ---
+    # штраф для луков в упоре
     tags = weapon.get("tags") or []
     is_bow = (str(weapon.get("ammo_type") or "").lower() == "arrow") or ("bow" in [t.lower() for t in (tags or [])])
     min_r = int(weapon.get("min_range") or 0)
-    if is_bow and min_r > 0 and (weapon.get("weapon_class") or "").lower() == "ranged":
-        if dist < min_r:
-            close_pen = (min_r - dist) * int(weapon.get("near_penalty") or 10)
-            if close_pen > 0:
-                mods["near_penalty"] = -close_pen
-                accuracy -= close_pen
+    if is_bow and min_r > 0 and (weapon.get("weapon_class") or "").lower() == "ranged" and dist < min_r:
+        close_pen = (min_r - dist) * int(weapon.get("near_penalty") or 10)
+        if close_pen > 0:
+            mods["near_penalty"] = -close_pen
+            accuracy -= close_pen
 
-    # acc_bonus (атакующий) и evasion (цель) из actors.meta
+    # из meta
     atk_acc = await _actor_stat_from_meta(session, attacker_id, "acc_bonus", 0)
     tgt_eva = await _actor_stat_from_meta(session, target_id,   "evasion",   0)
     if atk_acc:
@@ -2395,21 +2393,24 @@ async def perform_attack_db(session, attacker_id: str, target_id: str):
     if tgt_eva:
         mods["evasion"] = -int(tgt_eva);  accuracy -= int(tgt_eva)
 
-    # диапазон 5..95 (всегда шанс попасть/промахнуться)
-    accuracy = max(5, min(95, accuracy))
+    # --- статусные модификаторы (slow/guard/rage) ---
+    smods = await get_status_combat_mods(session, attacker_id, target_id)
+    acc_delta = smods.get("accuracy_mod_attacker", 0)
+    if acc_delta:
+        mods["status_acc"] = acc_delta
+        accuracy += acc_delta
 
+    accuracy = max(5, min(95, accuracy))
     roll = random.randint(1, 100)
     events.append({"type": "HIT_ROLL", "payload": {"accuracy": accuracy, "roll": roll, "mods": mods}})
-
     if roll > accuracy:
         events.append({"type": "ATTACK_MISS", "payload": {}})
         await session.commit()
         return {"ok": True, "events": events}
 
-    # --- базовый урон ---
-    base = weapon["base_damage"] or 5
-
-    # crit_mult из props (дефолт 2.0)
+    # --- базовый урон + крит ---
+    base = (weapon["base_damage"] or 5) + int(smods.get("damage_bonus_attacker", 0))
+    base = int(round(base * float(smods.get("damage_mult_attacker", 1.0))))
     crit_mult = 2.0
     try:
         row_props = (await session.execute(
@@ -2425,7 +2426,6 @@ async def perform_attack_db(session, attacker_id: str, target_id: str):
     except Exception:
         pass
 
-    # --- крит ---
     crit = roll <= (weapon["crit_chance"] or 0)
     if crit:
         base = int(round(base * crit_mult))
@@ -2441,23 +2441,109 @@ async def perform_attack_db(session, attacker_id: str, target_id: str):
         mod = tgt["resistances"].get(dmg_type)
         if mod is not None:
             resist_mod = float(mod)
-
     events.append({"type": "RESIST_APPLY", "payload": {"damage_type": dmg_type, "resist_mod": resist_mod}})
 
-    final_dmg = max(1, int(base * resist_mod))  # минимум 1 при попадании
-    events.append({"type": "DAMAGE_APPLY", "payload": {"base": base, "final": final_dmg}})
+    # --- броня цели (0..5 уровней) + бонус от guard ---
+    final_dmg = max(1, int(base * resist_mod))
+    armor_lvl = await effective_armor_level(session, target_id) + int(smods.get("armor_bonus_target", 0))
+    if armor_lvl < 0:
+        armor_lvl = 0
+    if armor_lvl > 5:
+        armor_lvl = 5
 
-    await session.execute(
-        text("UPDATE actors SET hp = GREATEST(hp - :dmg, 0) WHERE id=:tid"),
-        {"tid": target_id, "dmg": final_dmg}
-    )
+    armored = apply_armor_reduction(final_dmg, armor_lvl)
+    if armor_lvl > 0:
+        events.append({"type": "ARMOR_APPLY", "payload": {"level": armor_lvl, "before": final_dmg, "after": armored}})
+    final_dmg = armored
 
-    events.append({"type": "ATTACK_HIT", "payload": {}})
+    # --- применяем урон: stats.hp (JSONB) ---
+    await session.execute(text("""
+        update actors
+           set stats = jsonb_set(
+                coalesce(stats,'{}'::jsonb),
+                '{hp}',
+                to_jsonb( GREATEST(0, (coalesce((stats->>'hp')::int, 0)) - CAST(:dmg AS int)) ),
+                true
+           )
+         where id = :tid
+    """), {"tid": target_id, "dmg": int(final_dmg)})
+
+    events.append({"type": "DAMAGE_APPLY", "payload": {"final": final_dmg}})
 
     # --- смерть цели ---
-    nhp = (await session.execute(text("SELECT hp FROM actors WHERE id=:tid"), {"tid": target_id})).scalar_one()
+    nhp = (await session.execute(text("""
+        select coalesce((stats->>'hp')::int, 0) as hp from actors where id=:tid
+    """), {"tid": target_id})).mappings().first()["hp"]
     if nhp <= 0:
         events.append({"type": "DEATH", "payload": {"target": target_id}})
 
     await session.commit()
     return {"ok": True, "events": events}
+
+# --- REACTIVE COUNTER HELPERS ---
+
+async def _apply_tmp_status(
+    session: AsyncSession,
+    actor_id: str,
+    label: str,
+    turns: int,
+    meta: dict,
+    note: str = "",
+    tags: list[str] | None = None,
+) -> None:
+    """Запишем 1-ходовой статус в actor_statuses (session_id допускается NULL)."""
+    await session.execute(
+        text("""
+            insert into actor_statuses(actor_id, session_id, label, note, tags, turns_left, intensity, meta)
+            values(:aid, null, :lbl, :note, :tags, :ttl, 1, :meta)
+        """),
+        {
+            "aid": actor_id,
+            "lbl": label,
+            "note": note,
+            "tags": tags or [],
+            "ttl": int(turns),
+            "meta": meta or {},
+        }
+    )
+
+async def npc_reactive_counter_db(
+    session: AsyncSession,
+    npc_id: str,
+    target_id: str,
+    received_damage: int,
+) -> dict:
+    """
+    Реактивная ответка NPC:
+      - слабый удар героя (<=5)  -> press (+5 acc, +2 dmg)
+      - средний (6..11)         -> без модификаторов
+      - сильный (>=12)          -> по умолчанию stagger (-15 acc), но 20% шанс rage (+10 acc, +30% dmg)
+    Затем запускаем обычную атаку perform_attack_db(npc -> hero).
+    """
+    import random
+
+    received_damage = max(0, int(received_damage))
+
+    applied = []
+    if received_damage <= 5:
+        # «прижал» (чуть точнее и больнее)
+        await _apply_tmp_status(session, npc_id, "press", 1, {"accuracy_mod_attacker": 5, "damage_bonus_attacker": 2})
+        applied.append({"label": "press", "mods": {"+acc": 5, "+dmg": 2}})
+    elif 6 <= received_damage <= 11:
+        # нейтрально — без статуса
+        pass
+    else:
+        # сильный урон → обычно шатание, но редко ярость
+        if random.random() < 0.20:
+            await _apply_tmp_status(session, npc_id, "rage", 1, {"accuracy_mod_attacker": 10, "damage_mult_attacker": 1.3})
+            applied.append({"label": "rage", "mods": {"+acc": 10, "x dmg": 1.3}})
+        else:
+            await _apply_tmp_status(session, npc_id, "stagger", 1, {"accuracy_mod_attacker": -15})
+            applied.append({"label": "stagger", "mods": {"-acc": 15}})
+
+    await session.commit()
+
+    # запускаем обычную атаку (старый боевой движок)
+    # ВАЖНО: perform_attack_db уже учитывает статусные моды через get_status_combat_mods.
+    result = await perform_attack_db(session, attacker_id=npc_id, target_id=target_id)
+    return {"ok": True, "applied_statuses": applied, "attack": result}
