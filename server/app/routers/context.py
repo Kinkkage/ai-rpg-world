@@ -1,6 +1,7 @@
 # app/routers/context.py
 from __future__ import annotations
 from typing import Dict, Any, List
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
@@ -8,6 +9,7 @@ from sqlalchemy import text
 from app.db import get_session
 
 router = APIRouter(prefix="/combat", tags=["combat"])
+
 
 # -----------------------------
 # 1) Полный боевой контекст
@@ -83,7 +85,7 @@ async def combat_context(session_id: str, session: AsyncSession = Depends(get_se
             },
             "skills": skills_by_actor.get(aid, []),
             "statuses": statuses_by_actor.get(aid, []),
-            # NEW: отношение NPC к герою (0..100; 0 нейтрально). Это просто данные для ЛЛМ.
+            # отношение NPC к герою (0..100; 0 нейтрально). Просто данные для LLM.
             "attitude": {
                 "to_hero": int(p["hostility_to_player"] or 0),
                 "scale": "0-100"
@@ -101,24 +103,49 @@ async def combat_context(session_id: str, session: AsyncSession = Depends(get_se
         "actors": roster
     }
 
+
 # -----------------------------------------
-# 2) Локальный контекст 3×3 вокруг актёра
+# 2) Локальный контекст вокруг актёра (радиус)
 # -----------------------------------------
 @router.get("/context/grid/{actor_id}")
-async def grid_3x3(
+async def grid_around_actor(
     actor_id: str,
     session_id: str = Query(..., description="ID боевой сессии (для списка участников)"),
-    session: AsyncSession = Depends(get_session)
+    radius: int = Query(4, ge=1, le=8, description="Радиус окна вокруг актёра. 1=3x3, 4=9x9"),
+    session: AsyncSession = Depends(get_session),
 ):
+    """
+    Возвращает контекст вокруг актёра:
+      - центр: сам актёр
+      - окно: (2*radius+1)x(2*radius+1), по умолчанию 9x9
+    """
+
     center = (await session.execute(text("""
-        select id, node_id, x, y
-          from actors
-         where id=:aid
+        select a.id, a.node_id, a.x, a.y,
+               COALESCE(n.width, n.size_w, 16)  as w,
+               COALESCE(n.height, n.size_h, 16) as h
+          from actors a
+          join nodes n on n.id = a.node_id
+         where a.id=:aid
     """), {"aid": actor_id})).mappings().first()
     if not center:
         raise HTTPException(status_code=404, detail="actor_not_found")
 
-    # Актёры в окне 3×3
+    cx, cy = int(center["x"]), int(center["y"])
+    W, H = int(center["w"]), int(center["h"])
+
+    r = max(1, int(radius))
+
+    # границы окна с учётом карты
+    minx = max(0, cx - r)
+    maxx = min(W - 1, cx + r)
+    miny = max(0, cy - r)
+    maxy = min(H - 1, cy + r)
+
+    width = maxx - minx + 1
+    height = maxy - miny + 1
+
+    # --- актёры в этом окне (только участники текущей battle_session) ---
     rows = (await session.execute(text("""
         select a.id as actor_id, a.x, a.y, a.stats,
                coalesce((a.meta->'ai'->>'hostility_to_player')::int, 0) as hostility_to_player
@@ -131,23 +158,23 @@ async def grid_3x3(
     """), {
         "sid": session_id,
         "nid": center["node_id"],
-        "xmin": center["x"] - 1, "xmax": center["x"] + 1,
-        "ymin": center["y"] - 1, "ymax": center["y"] + 1,
+        "xmin": minx, "xmax": maxx,
+        "ymin": miny, "ymax": maxy,
     })).mappings().all()
 
-    # тайлы (низкий слой) — как раньше
+    # --- тайлы (низкий слой) — пока заглушка "ground" ---
     tiles = []
-    for dx in (-1, 0, 1):
-        for dy in (-1, 0, 1):
+    for x in range(minx, maxx + 1):
+        for y in range(miny, maxy + 1):
             tiles.append({
-                "x": int(center["x"] + dx),
-                "y": int(center["y"] + dy),
+                "x": x,
+                "y": y,
                 "kind": "ground",
                 "blocks_los": False,
                 "blocks_move": False,
             })
 
-    # объекты на слоях
+    # --- объекты на слоях ---
     obj_rows = (await session.execute(text("""
         select o.id, o.asset_id, o.x, o.y, o.layer, coalesce(o.props,'{}'::jsonb) as props
           from node_objects o
@@ -156,24 +183,24 @@ async def grid_3x3(
            and o.y between :ymin and :ymax
     """), {
         "nid": center["node_id"],
-        "xmin": center["x"] - 1, "xmax": center["x"] + 1,
-        "ymin": center["y"] - 1, "ymax": center["y"] + 1,
+        "xmin": minx, "xmax": maxx,
+        "ymin": miny, "ymax": maxy,
     })).mappings().all()
 
     objects = []
-    for r in obj_rows:
-        props = dict(r["props"] or {})
+    for r0 in obj_rows:
+        props = dict(r0["props"] or {})
         kind = props.get("kind", "prop")
         blocks_los = bool(props.get("blocks_los", kind in ("tree", "wall")))
         blocks_move = bool(props.get("blocks_move", kind in ("tree", "wall")))
         pickupable = bool(props.get("pickupable", kind in ("loot",)))
         is_container = bool(props.get("is_container", False))
         objects.append({
-            "id": int(r["id"]),
-            "asset_id": r["asset_id"],
-            "x": int(r["x"]),
-            "y": int(r["y"]),
-            "layer": int(r["layer"]),
+            "id": int(r0["id"]),
+            "asset_id": r0["asset_id"],
+            "x": int(r0["x"]),
+            "y": int(r0["y"]),
+            "layer": int(r0["layer"]),
             "kind": kind,
             "blocks_los": blocks_los,
             "blocks_move": blocks_move,
@@ -182,24 +209,36 @@ async def grid_3x3(
         })
 
     entities = []
-    for r in rows:
+    for r1 in rows:
         entities.append({
-            "actor_id": r["actor_id"],
-            "x": int(r["x"]),
-            "y": int(r["y"]),
-            "stats": dict(r["stats"] or {}),
-            "is_center": (r["actor_id"] == actor_id),
-            # NEW: соседям тоже отдаём отношение (удобно ЛЛМ для «кто агрится на игрока рядом»)
+            "actor_id": r1["actor_id"],
+            "x": int(r1["x"]),
+            "y": int(r1["y"]),
+            "stats": dict(r1["stats"] or {}),
+            "is_center": (r1["actor_id"] == actor_id),
             "attitude": {
-                "to_hero": int(r["hostility_to_player"] or 0),
+                "to_hero": int(r1["hostility_to_player"] or 0),
                 "scale": "0-100"
             },
         })
 
     return {
         "ok": True,
-        "center": {"actor_id": center["id"], "node_id": center["node_id"], "x": int(center["x"]), "y": int(center["y"])},
-        "area": {"w": 3, "h": 3},
+        "center": {
+            "actor_id": center["id"],
+            "node_id": center["node_id"],
+            "x": cx,
+            "y": cy,
+        },
+        "area": {
+            "w": width,
+            "h": height,
+            "minx": minx,
+            "maxx": maxx,
+            "miny": miny,
+            "maxy": maxy,
+            "radius": r,
+        },
         "entities": entities,
         "tiles": tiles,
         "objects": objects,

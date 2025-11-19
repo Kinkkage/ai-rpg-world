@@ -1,4 +1,5 @@
 # app/main.py — DROP-IN версия (без циклических импортов)
+
 import os
 import sys
 import json
@@ -6,17 +7,22 @@ import asyncio
 from datetime import datetime
 from typing import List, Literal, Optional, Dict, Any, Tuple
 
+from dotenv import load_dotenv
+load_dotenv()  # подхватываем .env ДО импортов app.*
+
 from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 from sqlalchemy import text, bindparam
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import JSONB  # UUID/ARRAY можно вернуть при необходимости
+
 from app.routers import skills as skills_router
 from app.routers import context as context_router
-from app.routers import do  
-# DB / DAO
+from app.routers import do  # /do, /do/npc_turn и т.п.
+
 import random  # для вероятности наложения статуса
+
 from app.db import get_session
 from app.dao import (
     fetch_node,
@@ -37,6 +43,12 @@ from app.dao import (
     # Drop from hidden:
     drop_hidden_to_ground_db,
 )
+
+from app.services.llm_client import call_llm_json, llm_diagnostics, llm_direct_test
+from app.services.llm_bus import HERO_SYSTEM_PROMPT, NPC_SYSTEM_PROMPT
+
+
+
 
 # ────────────────────────────────────────────────────────────────────────────────
 # ЛЕНИВЫЕ ПРОКСИ ДЛЯ dao_status (у тебя файл app/dao_status.py)
@@ -301,6 +313,110 @@ def debug_source():
         "python_exe": sys.executable,
         "sys_path_head": sys.path[:5],
     }
+
+@app.get("/debug/llm_ping")
+async def debug_llm_ping():
+    """
+    Простой пинг LLM: шлём тестовый ход героя и сморим, вернулся ли JSON.
+    """
+    payload = {
+        "actor": {
+            "id": "hero_test",
+            "stats": {"hp": 100, "damage": 10},
+            "meta": {},
+            "inventory": {
+                "left_hand": {"item": {"title": "Тестовый меч", "tags": ["sword", "melee"]}},
+                "right_hand": {"item": None},
+                "backpack_legacy": []
+            },
+            "skills": [],
+            "statuses": [],
+        },
+        "target": None,
+        "distance": 0,
+        "say": "проверка связи",
+        "act": "делаю пробный взмах мечом в воздух",
+    }
+
+    data = await call_llm_json(HERO_SYSTEM_PROMPT, payload)
+    return {
+        "ai_enabled_env": os.getenv("AI_ENABLED"),
+        "model": os.getenv("AI_MODEL"),
+        "ok": bool(data),
+        "raw": data,
+    }
+@app.get("/debug/llm_env")
+def debug_llm_env():
+    """
+    Показывает, что видит llm_client при импорте:
+    включён ли ИИ, виден ли ключ и т.п.
+    """
+    return llm_diagnostics()
+
+
+@app.get("/debug/llm_direct")
+async def debug_llm_direct():
+    """
+    Делает простой запрос к модели прямо из сервера.
+    Если тут ok=true и content='привет' — значит LLM через AsyncOpenAI работает.
+    """
+    return await llm_direct_test()
+
+@app.get("/debug/llm_npc_ping")
+async def debug_llm_npc_ping():
+    """
+    Пинг LLM именно с NPC-промптом и форматом payload, как в /do/npc_turn.
+    Помогает отлавливать проблемы с JSON для NPC.
+    """
+    payload = {
+        "actor": {
+            "id": "npc_test",
+            "stats": {"hp": 50, "damage": 8},
+            "meta": {
+                "ai": {
+                    "hostility_to_player": 0.8
+                }
+            },
+            "inventory": {
+                "left_hand": {"item": None},
+                "right_hand": {
+                    "item": {
+                        "title": "Ржавый нож",
+                        "tags": ["melee", "knife"]
+                    }
+                },
+                "backpack_legacy": []
+            },
+            "skills": [],
+            "statuses": [],
+        },
+        "target": {
+            "id": "hero_test",
+            "stats": {"hp": 100, "damage": 10},
+            "meta": {},
+            "inventory": {
+                "left_hand": {"item": None},
+                "right_hand": {"item": None},
+                "backpack_legacy": []
+            },
+            "skills": [],
+            "statuses": [],
+        },
+        "distance": 1,
+        "last_damage_taken": 5,
+        "hero_say": "Эй, успокойся, давай поговорим.",
+        "hero_act": "опускает оружие и делает шаг назад",
+        "battle_history": [],
+    }
+
+    data = await call_llm_json(NPC_SYSTEM_PROMPT, payload)
+    return {
+        "ai_enabled_env": os.getenv("AI_ENABLED"),
+        "model": os.getenv("AI_MODEL"),
+        "ok": bool(data),
+        "raw": data,
+    }
+
 
 # ────────────────────────────────────────────────────────────────────────────────
 # NODE / INVENTORY VIEW
@@ -1456,6 +1572,9 @@ async def debug_seed_npc_simple(body: SeedNpcIn, session: AsyncSession = Depends
 # ────────────────────────────────────────────────────────────────────────────────
 # РЕГИСТРАЦИЯ РОУТЕРОВ
 # ────────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────────
+# РЕГИСТРАЦИЯ РОУТЕРОВ
+# ────────────────────────────────────────────────────────────────────────────────
 app.include_router(world.router)
 app.include_router(narrative.router)
 app.include_router(assets.router)
@@ -1466,9 +1585,12 @@ app.include_router(battle_router.router)   # боевой роутер
 app.include_router(inventory_router)
 app.include_router(items_router)
 app.include_router(combat_router)
+
+# наши новые/существующие роутеры
 app.include_router(skills_router.router)
 app.include_router(context_router.router)
-app.include_router(do.router) 
+app.include_router(do.router)
+
 # Health-check корень
 @app.get("/")
 async def root():
