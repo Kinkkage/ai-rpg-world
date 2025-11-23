@@ -2126,6 +2126,29 @@ async def _spend_one_charge(session, item_id: str) -> int | None:
 from sqlalchemy import text
 import random
 
+async def handle_actor_death(session: AsyncSession, actor_id: str) -> None:
+    """
+    Общий хук для смерти актёра.
+    Сейчас делает минимум:
+    - гарантированно ставит hp = 0 в stats.
+    Дальше можно расширить: телепорт героя, дроп лута, отметка "труп" и т.п.
+    """
+    await session.execute(
+        text(
+            """
+            update actors
+               set stats = jsonb_set(
+                    coalesce(stats, '{}'::jsonb),
+                    '{hp}',
+                    to_jsonb(0),
+                    true
+               )
+             where id = :aid
+            """
+        ),
+        {"aid": actor_id},
+    )
+
 # ----------------- ammo helpers -----------------
 async def _weapon_ammo_type_for_item(session, item_id: str) -> str | None:
     row = (await session.execute(

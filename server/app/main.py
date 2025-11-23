@@ -20,6 +20,7 @@ from sqlalchemy.dialects.postgresql import JSONB  # UUID/ARRAY можно вер
 from app.routers import skills as skills_router
 from app.routers import context as context_router
 from app.routers import do  # /do, /do/npc_turn и т.п.
+from app.routers import debug_actor
 
 import random  # для вероятности наложения статуса
 
@@ -1590,6 +1591,7 @@ app.include_router(combat_router)
 app.include_router(skills_router.router)
 app.include_router(context_router.router)
 app.include_router(do.router)
+app.include_router(debug_actor.router)
 
 # Health-check корень
 @app.get("/")

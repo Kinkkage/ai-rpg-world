@@ -49,7 +49,8 @@ async def call_llm_json(system_prompt: str, payload: Dict[str, Any]) -> Optional
         return None
 
     # Пробуем понять, кто вызывает — герой или NPC (по тексту промпта)
-    origin = "npc" if "Отвечаешь ЗА NPC" in system_prompt else "hero"
+    # Чуть расширим условие: вдруг промпт поменяется и будет просто "NPC"
+    origin = "npc" if ("Отвечаешь ЗА NPC" in system_prompt or "NPC" in system_prompt) else "hero"
 
     # ВАЖНО: default=str → UUID и прочие нестандартные типы превращаем в строки
     try:
@@ -99,11 +100,34 @@ async def call_llm_json(system_prompt: str, payload: Dict[str, Any]) -> Optional
         log.error(f"[LLM:{origin}] empty content from model")
         return None
 
+    # --- Первая попытка: обычный json.loads ---
     try:
         data = json.loads(content)
     except json.JSONDecodeError as e:
         # КРИТИЧНО ДЛЯ НАС: здесь видно сырое содержимое
         log.error(f"[LLM:{origin}] JSON decode error: {e}; content={content!r}")
+
+        # --- Вторая попытка: "ремонт" JSON ---
+        # Иногда модель может вернуть текст с лишними словами, ```json и т.п.
+        # Пробуем вырезать кусок от первой '{' до последней '}'.
+        start = content.find("{")
+        end = content.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            trimmed = content[start : end + 1]
+            try:
+                data = json.loads(trimmed)
+                log.warning(
+                    f"[LLM:{origin}] JSON salvage succeeded after trimming content "
+                    f"(len={len(content)} -> {len(trimmed)})"
+                )
+            except Exception as e2:
+                log.error(f"[LLM:{origin}] JSON salvage failed: {e2}; trimmed={trimmed!r}")
+                return None
+        else:
+            # Не нашли в ответе даже фигурные скобки — совсем мусор
+            return None
+    except Exception as e:
+        log.exception(f"[LLM:{origin}] unexpected error while parsing JSON: {e}")
         return None
 
     if not isinstance(data, dict):
@@ -112,7 +136,6 @@ async def call_llm_json(system_prompt: str, payload: Dict[str, Any]) -> Optional
 
     log.debug(f"[LLM:{origin}] JSON parsed ok")
     return data
-
 
 
 # ---- ВСПОМОГАТЕЛЬНЫЕ ШТУКИ ДЛЯ /debug/llm_ping И /debug/llm_direct ----
